@@ -53,7 +53,11 @@ jobs:
 
       - name: Assemble GitHub debug APK
         working-directory: src/android
-        run: ./gradlew --no-daemon :app:assembleGithubDebug
+        run: >
+          ./gradlew --no-daemon --max-workers=2
+          -Pkotlin.compiler.execution.strategy=in-process
+          "-Dorg.gradle.jvmargs=-Xmx8g -Dfile.encoding=UTF-8"
+          :app:assembleGithubDebug
 
       - name: Sign and verify the APK
         env:
