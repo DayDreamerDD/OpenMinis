@@ -167,7 +167,7 @@ class CtxSession(val name: String, val window: Int? = 200_000) : AutoCloseable {
             if (text.isNotEmpty()) add(AgentContentPart.Text(text))
             calls.forEach { add(AgentContentPart.ToolUse(it.id, it.name, it.input)) }
         }
-        val json = ImageRealFixtures.callPrivate(vm, "buildAssistantPartsJson", parts, emptyMap<String, Any>()) as String
+        val json = ImageRealFixtures.callPrivate(vm, "buildAssistantPartsJson", parts, emptyMap<String, Any>(), null) as String
         val row = append("assistant", json)
         history += LLMMessage(LLMMessage.Role.ASSISTANT, text, contentParts = parts, dbMessageId = row.id)
         return row

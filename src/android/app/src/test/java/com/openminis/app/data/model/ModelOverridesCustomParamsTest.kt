@@ -36,6 +36,7 @@ class ModelOverridesCustomParamsTest {
         assertEquals("Old Model", decoded.displayName)
         assertEquals(4096, decoded.maxOutputTokens)
         assertNull("absent key must stay null, not 0.0", decoded.temperature)
+        assertNull(decoded.nativeWebEnabled)
         assertNull(decoded.topP)
         assertNull(decoded.customHeaders)
         assertNull(decoded.extraBodyParams)
@@ -51,6 +52,7 @@ class ModelOverridesCustomParamsTest {
     fun `round trip preserves all four new fields`() {
         val original = ModelOverrides(
             displayName = "Tuned",
+            nativeWebEnabled = true,
             temperature = 0.35,
             topP = 0.9,
             customHeaders = mapOf("X-Trace" to "abc", "X-Tier" to "pro"),
@@ -88,6 +90,7 @@ class ModelOverridesCustomParamsTest {
         // isEmpty gates whether the overrides object is exported at all, so an
         // entry carrying ONLY one of these must not look empty and be dropped.
         assertTrue(ModelOverrides().isEmpty)
+        assertTrue(!ModelOverrides(nativeWebEnabled = true).isEmpty)
         assertTrue(!ModelOverrides(temperature = 0.7).isEmpty)
         assertTrue(!ModelOverrides(topP = 0.5).isEmpty)
         assertTrue(!ModelOverrides(customHeaders = mapOf("a" to "b")).isEmpty)

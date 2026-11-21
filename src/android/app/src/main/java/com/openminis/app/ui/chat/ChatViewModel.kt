@@ -49,6 +49,7 @@ import com.openminis.app.provider.DsmlLeak
 import com.openminis.app.provider.ImageBudget
 import com.openminis.app.provider.LLMProvider
 import com.openminis.app.provider.ProviderFactory
+import com.openminis.app.provider.supportsNativeWeb
 import com.openminis.app.provider.catalogMaxThinkingLevel
 import com.openminis.app.provider.withIdleTimeout
 import com.openminis.app.provider.effectiveMaxThinkingLevel
@@ -11668,6 +11669,7 @@ class ChatViewModel(
             // server-emitted value round-trips on the next request — DeepSeek V4
             // emits "" legitimately and fabricated text would be in-context-learned.
             var turnReasoningBlob: String? = null
+            var turnWebReplay: String? = null
             // T321: capture finish_reason from LLMStreamChunk.Finished so we can
             // log it at turn-end alongside the empty-turn warning.
             var turnFinishReason: String? = null
@@ -11913,10 +11915,17 @@ class ChatViewModel(
                                 requestMessages = withReminder
                             }
                         }
+                        val webEnabled = currentIdentity?.let { id ->
+                            val config = providerRepository.config.value
+                            val entry = config.modelEntries.find { it.id == id.entryId }
+                            entry?.overrides?.nativeWebEnabled == true &&
+                                config.instances.find { it.id == id.instanceId }?.supportsNativeWeb(currentProvider.model.id) == true
+                        } == true
                         currentProvider.streamMessage(
                             requestMessages,
                             loopSystemPrompt, dynamicMaxTokens(currentProvider, dispatchInputTokens),
                             tools = if (helperWrapUpInjected) emptyList() else agentTools,
+                            nativeWebEnabled = webEnabled && !helperWrapUpInjected,
                             // [T-switch-model-thinking-gate] Gate on the provider that
                             // serves THIS turn. selectEntry swaps the class-level
                             // currentModel mid-turn while the turn keeps its local
@@ -12318,6 +12327,7 @@ class ChatViewModel(
                         turnReasoningBlob = chunk.content
                     }
                     is LLMStreamChunk.Finished -> {
+                        turnWebReplay = chunk.nativeWebReplay
                         // T321: stash for empty-turn diagnostic logging below.
                         turnFinishReason = chunk.stopReason
                         turnRefusalCategory = chunk.refusalCategory
@@ -12832,6 +12842,7 @@ class ChatViewModel(
                 content = turnText,
                 contentParts = assistantParts,
                 reasoningContent = turnReasoningContent,
+                nativeWebReplay = turnWebReplay,
             ))
 
             // [T-b13-empty-fallback] A turn with content ends the empty streak.
@@ -12922,7 +12933,7 @@ class ChatViewModel(
                 }
                 val turnParts = buildTurnParts(allToolBlocks, turnStartBlockIndex, toolInputMap)
                 val blockMeta = allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
-                persistAssistantTurn(turnParts, lastUsage, turnReasoningContent, blockMeta, uiAssistantId = assistantId, streamMs = turnStreamMs)
+                persistAssistantTurn(turnParts, lastUsage, turnReasoningContent, blockMeta, uiAssistantId = assistantId, streamMs = turnStreamMs, nativeWebReplay = turnWebReplay)
                 // [T-error-persist-android] Empty-response hint: the model ended a
                 // turn (finish=stop/end_turn) with no visible text anywhere in the
                 // reply and no tool blocks — the user just sees a blank bubble.
@@ -13833,7 +13844,7 @@ class ChatViewModel(
             // assistant entry — compact-marker boundary resolution depends on it.
             val turnParts = buildTurnParts(allToolBlocks, turnStartBlockIndex, toolInputMap)
             val blockMeta = allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
-            val assistantDbId = persistAssistantTurn(turnParts, lastUsage, turnReasoningContent, blockMeta, uiAssistantId = assistantId, streamMs = turnStreamMs)
+            val assistantDbId = persistAssistantTurn(turnParts, lastUsage, turnReasoningContent, blockMeta, uiAssistantId = assistantId, streamMs = turnStreamMs, nativeWebReplay = turnWebReplay)
             if (assistantDbId != null) {
                 val lastIdx = agentHistory.indexOfLast { it.role == LLMMessage.Role.ASSISTANT && it.dbMessageId == null }
                 if (lastIdx >= 0) {
@@ -16086,13 +16097,18 @@ class ChatViewModel(
     private fun buildAssistantPartsJson(
         parts: List<AgentContentPart>,
         toolBlockMeta: Map<String, AssistantBlock>,
+        nativeWebReplay: String? = null,
     ): String = buildString {
         append("[")
         parts.forEachIndexed { index, part ->
             if (index > 0) append(",")
+            // Keep wire metadata on the first part. Existing readers display its normal value.
+            val replayField = if (index == 0 && nativeWebReplay != null) {
+                "\"nativeWebReplay\":${escapeJson(nativeWebReplay)},"
+            } else ""
             when (part) {
                 is AgentContentPart.Text -> {
-                    append("""{"type":"text","value":${escapeJson(part.text)}}""")
+                    append("""{${replayField}"type":"text","value":${escapeJson(part.text)}}""")
                 }
                 is AgentContentPart.ToolUse -> {
                     // Skip tool_use with blank name — upstream bug guard.
@@ -16107,7 +16123,7 @@ class ChatViewModel(
                     // signature (null-literal when absent) so it survives a session
                     // reload and can be replayed on the historical functionCall.
                     val sigJson = part.thoughtSignature?.let { escapeJson(it) } ?: "null"
-                    append("""{"type":"toolUse","value":{"toolUseId":${escapeJson(part.id)},"name":${escapeJson(name)},"input":${escapeJson(inputStr)},"description":${escapeJson(desc)},"pageURL":${escapeJson(pageURL)},"imageFilePath":${escapeJson(imgPath)},"thoughtSignature":$sigJson}}""")
+                    append("""{${replayField}"type":"toolUse","value":{"toolUseId":${escapeJson(part.id)},"name":${escapeJson(name)},"input":${escapeJson(inputStr)},"description":${escapeJson(desc)},"pageURL":${escapeJson(pageURL)},"imageFilePath":${escapeJson(imgPath)},"thoughtSignature":$sigJson}}""")
                 }
                 else -> { /* tool_result is persisted via persistToolResultMessage */ }
             }
@@ -16130,9 +16146,10 @@ class ChatViewModel(
         // "not measured", which is also what every row written before this
         // change reads as — hence a NEW key rather than a changed one.
         streamMs: Long = 0L,
+        nativeWebReplay: String? = null,
     ): String? {
         if (parts.isEmpty()) return null
-        val partsJson = buildAssistantPartsJson(parts, toolBlockMeta)
+        val partsJson = buildAssistantPartsJson(parts, toolBlockMeta, nativeWebReplay)
         val tokenJson = usage?.let {
             """{"inputTokens":${it.inputTokens},"outputTokens":${it.outputTokens},"cacheCreationTokens":${it.cacheCreationInputTokens ?: 0},"cacheReadTokens":${it.cacheReadInputTokens ?: 0},"latestContextTokens":${it.latestContextTokens},"streamMs":$streamMs${com.openminis.app.usage.StoredUsageJson.extraFields(it)}${calibrationJsonFields()}}"""
         }
@@ -18741,9 +18758,11 @@ internal object ChatHistoryRebuild {
             val contentParts = mutableListOf<AgentContentPart>()
             val imageParts = mutableListOf<LLMMessage.ImagePart>()
             var textContent = ""
+            var nativeWebReplay: String? = null
 
             try {
                 val array = org.json.JSONArray(partsJson)
+                nativeWebReplay = array.optJSONObject(0)?.opt("nativeWebReplay") as? String
                 for (i in 0 until array.length()) {
                     val obj = array.getJSONObject(i)
                     when (obj.optString("type")) {
@@ -18891,6 +18910,7 @@ internal object ChatHistoryRebuild {
                 contentParts = contentParts,
                 dbMessageId = id,
                 reasoningContent = reasoningContent,
+                nativeWebReplay = nativeWebReplay,
             )
         }
     }

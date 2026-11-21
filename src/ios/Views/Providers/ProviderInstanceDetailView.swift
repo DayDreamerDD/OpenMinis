@@ -1512,6 +1512,7 @@ struct ModelEntryDetailSheet: View {
     @State private var imageOutput: Bool = false
     @State private var audioOutput: Bool = false
     @State private var contextWindowText: String = ""
+    @State private var nativeWebEnabled = false
     @State private var supportsThinking: Bool = false
     @State private var maxTokensText: String = ""
     /// [T-ios-model-quick-test] Presents the modality-matched Quick Test sheet.
@@ -1634,6 +1635,12 @@ struct ModelEntryDetailSheet: View {
                         Text(AppLocalized("Capabilities"))
                     } footer: {
                         Text(AppLocalized("Leave Context Window empty to use auto-detected value. Leave Max Output Tokens empty to follow the provider default."))
+                    }
+                }
+
+                if store.instance(for: entry.providerInstanceId)?.supportsNativeWeb(modelID: modelId) == true {
+                    Section {
+                        Toggle(AppLocalized("Native web search and page reading"), isOn: $nativeWebEnabled)
                     }
                 }
 
@@ -1853,6 +1860,7 @@ struct ModelEntryDetailSheet: View {
         if let ctx = effective.contextWindow {
             contextWindowText = "\(ctx)"
         }
+        nativeWebEnabled = entry.overrides.nativeWebEnabled == true
         supportsThinking = effective.supportsReasoning ?? false
         // Max tokens text is populated only from the user override — leaving empty
         // means "follow the API/provider default" (shown as placeholder).
@@ -1870,6 +1878,7 @@ struct ModelEntryDetailSheet: View {
 
         let base = entry.baseModel
         displayName = base.displayName
+        nativeWebEnabled = false
         supportsThinking = base.supportsReasoning ?? false
         maxTokensText = ""
         if let ctx = base.contextWindow {
@@ -1920,7 +1929,7 @@ struct ModelEntryDetailSheet: View {
         let trimmedContextWindow = contextWindowText.trimmingCharacters(in: .whitespaces)
         let typedContextWindow: Int? = trimmedContextWindow.isEmpty ? nil : Int(trimmedContextWindow)
 
-        let updatedBaseModel = LLMModel(
+        var updatedBaseModel = LLMModel(
             id: finalId,
             displayName: entry.baseModel.displayName,
             provider: entry.baseModel.provider,
@@ -1928,8 +1937,12 @@ struct ModelEntryDetailSheet: View {
             contextWindow: entry.baseModel.contextWindow,
             maxOutputTokens: entry.baseModel.maxOutputTokens,
             supportsReasoning: entry.baseModel.supportsReasoning,
-            interleavedReasoningField: entry.baseModel.interleavedReasoningField
+            interleavedReasoningField: entry.baseModel.interleavedReasoningField,
+            reasoningEffortValues: entry.baseModel.reasoningEffortValues,
+            declaresNoEffortTiers: entry.baseModel.declaresNoEffortTiers
         )
+        updatedBaseModel.voiceRole = entry.baseModel.voiceRole
+        updatedBaseModel.limitsReportedByEndpoint = entry.baseModel.limitsReportedByEndpoint
 
         // Build overrides.
         //
@@ -1949,7 +1962,9 @@ struct ModelEntryDetailSheet: View {
         // auto-detected value" — so EMPTY is the way back to auto, and a filled field
         // is a choice that must persist. baseModel stays API truth either way (see the
         // comment above): overrides is the only place a refresh preserves verbatim.
-        var newOverrides = ModelOverrides()
+        var newOverrides = entry.overrides
+        newOverrides.nativeWebEnabled = nativeWebEnabled ? true : nil
+        newOverrides.displayName = nil
 
         let effectiveTypedName = trimmedName.isEmpty ? updatedBaseModel.displayName : trimmedName
         if effectiveTypedName != updatedBaseModel.displayName {

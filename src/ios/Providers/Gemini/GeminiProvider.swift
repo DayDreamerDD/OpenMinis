@@ -29,6 +29,13 @@ final class GeminiProvider: LLMProvider {
     var model: LLMModel
 
     private static let defaultBasePath = "https://generativelanguage.googleapis.com/v1beta"
+    static func supportsNativeWeb(_ modelID: String) -> Bool {
+        let id = modelID.lowercased().split(separator: "/").last.map(String.init) ?? ""
+        return id.range(of: #"^gemini-3([.-]|$)"#, options: .regularExpression) != nil &&
+            !["image", "tts", "audio", "robotics", "computer-use", "live"].contains(where: { id.contains($0) })
+    }
+
+    var nativeWebUpstream: String { basePath }
     private let basePath: String
     private let cloudCodeBase = "https://cloudcode-pa.googleapis.com/v1internal"
     private let authMode: GeminiAuthMode
@@ -189,7 +196,21 @@ final class GeminiProvider: LLMProvider {
         if !thinkCfg.isEmpty { genConfig["thinkingConfig"] = thinkCfg }
         body["generationConfig"] = genConfig
 
-        if !tools.isEmpty {
+        let nativeWeb = model.nativeWebEnabled == true
+        if nativeWeb {
+            guard case .apiKey = authMode else {
+                throw LLMError.providerError(message: "Native web tools require the Gemini API-key provider.")
+            }
+            guard Self.supportsNativeWeb(model.id) else {
+                throw LLMError.providerError(message: "Combining native web and agent tools requires a Gemini 3 model.")
+            }
+            var declarations: [[String: Any]] = [["googleSearch": [:] as [String: Any]], ["urlContext": [:] as [String: Any]]]
+            if !tools.isEmpty {
+                declarations.append(["functionDeclarations": tools])
+            }
+            body["toolConfig"] = ["includeServerSideToolInvocations": true]
+            body["tools"] = declarations
+        } else if !tools.isEmpty {
             body["tools"] = [["functionDeclarations": tools]]
             body["toolConfig"] = ["functionCallingConfig": ["mode": "AUTO"]]
         }
@@ -207,6 +228,11 @@ final class GeminiProvider: LLMProvider {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    var replayParts: [[String: Any]] = []
+                    var sources: [String] = []
+                    var chunkURLs: [String?] = []
+                    var supports: [[String: Any]] = []
+                    var finish: GeminiStreamEvent?
                     for try await line in bytes.lines {
                         guard !Task.isCancelled else { break }
                         guard line.hasPrefix("data: ") else { continue }
@@ -215,6 +241,24 @@ final class GeminiProvider: LLMProvider {
                         guard let jsonData = jsonStr.data(using: .utf8),
                               let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else { continue }
 
+                        let candidate = (self.unwrapCloudCodeResponse(json)["candidates"] as? [[String: Any]])?.first
+                        if nativeWeb, let candidate {
+                            let grounding = candidate["groundingMetadata"] as? [String: Any]
+                            let chunks = grounding?["groundingChunks"] as? [[String: Any]] ?? []
+                            chunkURLs.append(contentsOf: chunks.map { ($0["web"] as? [String: Any])?["uri"] as? String })
+                            supports.append(contentsOf: grounding?["groundingSupports"] as? [[String: Any]] ?? [])
+                            let urlContext = candidate["urlContextMetadata"] as? [String: Any]
+                            let urls = urlContext?["urlMetadata"] as? [[String: Any]] ?? []
+                            let links = chunks.compactMap { ($0["web"] as? [String: Any])?["uri"] as? String }
+                                + urls.filter { $0["urlRetrievalStatus"] as? String == "URL_RETRIEVAL_STATUS_SUCCESS" }.compactMap { $0["retrievedUrl"] as? String }
+                            for link in links where !sources.contains(link) && Self.isWebSource(link) {
+                                sources.append(link)
+                            }
+                        }
+                        if nativeWeb, let content = candidate?["content"] as? [String: Any],
+                           let parts = content["parts"] as? [[String: Any]] {
+                            replayParts.append(contentsOf: parts)
+                        }
                         let events = self.parseStreamChunk(json)
                         #if DEBUG
                         if !events.isEmpty {
@@ -222,9 +266,24 @@ final class GeminiProvider: LLMProvider {
                         }
                         #endif
                         for event in events {
-                            continuation.yield(event)
+                            if nativeWeb, case .finishReason = event {
+                                finish = event
+                            } else {
+                                continuation.yield(event)
+                            }
                         }
                     }
+                    let answer = replayParts.filter { $0["thought"] as? Bool != true }.compactMap { $0["text"] as? String }.joined()
+                    let sourceText = Self.sourceText(answer: answer, sources: sources, chunks: chunkURLs, supports: supports)
+                    if replayParts.contains(where: { $0["toolCall"] != nil || $0["toolResponse"] != nil || $0["functionCall"] != nil }),
+                       let data = try? JSONSerialization.data(withJSONObject: ["parts": replayParts, "sourceText": sourceText]),
+                       let replay = String(data: data, encoding: .utf8) {
+                        continuation.yield(.nativeWebReplay(replay))
+                    }
+                    if !sourceText.isEmpty {
+                        continuation.yield(.textDelta(sourceText))
+                    }
+                    if let finish { continuation.yield(finish) }
                     continuation.yield(.done)
                     continuation.finish()
                 } catch {
@@ -584,6 +643,40 @@ final class GeminiProvider: LLMProvider {
     }
 
     /// Parse a single SSE chunk from streaming response into events.
+    static func sourceText(answer: String, sources: [String], chunks: [String?], supports: [[String: Any]]) -> String {
+        var lines: [String] = []
+        var cited = Set<String>()
+        for support in supports {
+            guard let segment = support["segment"] as? [String: Any], let quote = segment["text"] as? String,
+                  !quote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, answer.contains(quote),
+                  let indices = support["groundingChunkIndices"] as? [Int] else { continue }
+            var links: [String] = []
+            for index in indices {
+                guard chunks.indices.contains(index), let url = chunks[index], let number = sources.firstIndex(of: url) else { continue }
+                let link = "[\(number + 1)](<\(url)>)"
+                if !links.contains(link) { links.append(link) }
+                cited.insert(url)
+            }
+            guard !links.isEmpty else { continue }
+            let flat = quote.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            let label = flat.unicodeScalars.map { scalar -> String in
+                let n = scalar.value
+                let escape = (33...47).contains(n) || (58...64).contains(n) || (91...96).contains(n) || (123...126).contains(n)
+                return (escape ? "\\" : "") + String(scalar)
+            }.joined()
+            let line = "- " + label + " " + links.joined(separator: " ")
+            if !lines.contains(line) { lines.append(line) }
+        }
+        lines += sources.filter { !cited.contains($0) }.map { "- <\($0)>" }
+        return lines.isEmpty ? "" : "\n\nSources\n" + lines.joined(separator: "\n")
+    }
+
+    static func isWebSource(_ text: String) -> Bool {
+        guard let url = URLComponents(string: text), let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme), url.host?.isEmpty == false else { return false }
+        return text.rangeOfCharacter(from: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "<>"))) == nil
+    }
+
     private func parseStreamChunk(_ json: [String: Any]) -> [GeminiStreamEvent] {
         var events: [GeminiStreamEvent] = []
         let effective = unwrapCloudCodeResponse(json)
@@ -593,9 +686,7 @@ final class GeminiProvider: LLMProvider {
         }
 
         guard let candidates = effective["candidates"] as? [[String: Any]],
-              let first = candidates.first,
-              let content = first["content"] as? [String: Any],
-              let parts = content["parts"] as? [[String: Any]] else {
+              let first = candidates.first else {
             // Could be usage-only chunk
             if let usage = extractUsage(json) {
                 events.append(.usage(usage))
@@ -603,6 +694,8 @@ final class GeminiProvider: LLMProvider {
             return events
         }
 
+        let content = first["content"] as? [String: Any]
+        let parts = content?["parts"] as? [[String: Any]] ?? []
         for part in parts {
             if let text = part["text"] as? String, !text.isEmpty {
                 let isThought = part["thought"] as? Bool ?? false
@@ -811,6 +904,7 @@ final class GeminiProvider: LLMProvider {
         // Parsed events
         for event in events {
             switch event {
+            case .nativeWebReplay: break
             case .textDelta(let text):
                 let preview = String(text.prefix(100))
                 parts.append("  → textDelta(\(text.count) chars): \"\(preview)\"" + (text.count > 100 ? "..." : ""))
@@ -858,6 +952,7 @@ final class GeminiProvider: LLMProvider {
 // MARK: - Gemini Stream Event
 
 enum GeminiStreamEvent {
+    case nativeWebReplay(String)
     case textDelta(String)
     case thinkingDelta(String)
     case functionCall(name: String, args: [String: Any], thoughtSignature: String?)

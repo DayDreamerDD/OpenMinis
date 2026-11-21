@@ -3289,6 +3289,7 @@ class ProviderRepository(private val context: Context) {
                         entry.overrides.maxThinkingLevel?.let {
                             o.put("maxThinkingLevel", it.name.lowercase())
                         }
+                        entry.overrides.nativeWebEnabled?.let { o.put("nativeWebEnabled", it) }
                         entry.overrides.temperature?.let { o.put("temperature", it) }
                         entry.overrides.topP?.let { o.put("topP", it) }
                         entry.overrides.customHeaders?.let { headers ->
@@ -3815,6 +3816,7 @@ class ProviderRepository(private val context: Context) {
                         // absent key stays null ("inherit") rather than
                         // collapsing to 0.0 / empty — 0.0 is a real temperature
                         // and must not be synthesized from absence.
+                        nativeWebEnabled = overridesObj.opt("nativeWebEnabled") as? Boolean,
                         temperature = if (overridesObj.has("temperature")) {
                             overridesObj.optDouble("temperature").takeIf { !it.isNaN() }
                         } else null,

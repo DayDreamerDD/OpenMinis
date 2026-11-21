@@ -120,6 +120,49 @@ final class OpenAIAgentProvider: AgentProvider {
         }
     }
 
+    private var isDeepSeekWebEndpoint: Bool {
+        provider.customBaseURL.flatMap { URL(string: $0)?.host?.lowercased() } == "api.deepseek.com"
+    }
+
+    private func nativeWebTools(responses: Bool) -> [[String: Any]] {
+        Self.nativeWebTypes(enabled: model.nativeWebEnabled == true, responses: responses,
+                            deepSeek: isDeepSeekWebEndpoint, modelID: model.id).map { ["type": $0] }
+    }
+
+    static func nativeWebTypes(enabled: Bool, responses: Bool, deepSeek: Bool, modelID: String) -> [String] {
+        guard enabled else { return [] }
+        if deepSeek && modelID == "deepseek-flash" {
+            return ["deepseek_web_search", "deepseek_read_url"]
+        }
+        if responses && (!deepSeek || modelID == "deepseek-v4-pro") {
+            return ["web_search"]
+        }
+        return []
+    }
+
+    private func nativeReplay(_ message: AgentMessage, kind: String) -> [[String: Any]]? {
+        guard isDeepSeekWebEndpoint, model.nativeWebEnabled == true, message.role == .assistant,
+              let echo = message.reasoningEcho, echo.modelId == model.id,
+              echo.providerKind == kind, echo.upstreamIdentity == reasoningUpstreamIdentity,
+              let data = echo.nativeWebReplay?.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+    }
+
+    private static func replayJSON(_ items: [[String: Any]]) -> String? {
+        guard !items.isEmpty, let data = try? JSONSerialization.data(withJSONObject: items) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func citationURL(_ annotation: [String: Any]) -> String? {
+        guard annotation["type"] as? String == "url_citation" else { return nil }
+        let citation = annotation["url_citation"] as? [String: Any] ?? annotation
+        guard let href = citation["url"] as? String, let url = URL(string: href),
+              ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.host != nil,
+              url.user == nil, url.password == nil,
+              !href.contains("<"), !href.contains(">"), !href.contains(where: { $0.isWhitespace }) else { return nil }
+        return url.absoluteString
+    }
+
     // MARK: - Chat Completions (API Key mode)
 
     private func streamChatCompletions(
@@ -133,7 +176,7 @@ final class OpenAIAgentProvider: AgentProvider {
         let openAITools = convertToolsChatCompletions(tools)
 
         var allMessages = openAIMessages
-        var toolsPayload = openAITools
+        var toolsPayload = openAITools + nativeWebTools(responses: false)
 
         // DashScope Qwen cache control: inject cache_control breakpoints on
         // system prompt (content-block array), last tool, and last 2 user messages.
@@ -255,6 +298,7 @@ final class OpenAIAgentProvider: AgentProvider {
                 // round-trip that empty value back as history rather than fabricating
                 // placeholder text the model would learn to imitate.
                 var sawReasoningFieldEver = false
+                var lastWebStepReasoningStart: String.Index?
                 // [T-openai-done-overwrite] GH#263. Set once a finish_reason chunk
                 // has yielded `.done`. OpenRouter (and OpenAI) always follow it
                 // with `data: [DONE]`, and the [DONE] branch used to yield a
@@ -324,7 +368,7 @@ final class OpenAIAgentProvider: AgentProvider {
                             // fragment / withheld trailing whitespace).
                             emitParsed(thinkParser.finishTurn())
                             if sawReasoningFieldEver || !reasoningContent.isEmpty {
-                                continuation.yield(.reasoningContent(reasoningContent))
+                                continuation.yield(.reasoningContent(String(reasoningContent[(lastWebStepReasoningStart ?? reasoningContent.startIndex)...])))
                             }
                             // A proxy that sends no finish_reason still needs
                             // [DONE] to end the turn.
@@ -382,6 +426,7 @@ final class OpenAIAgentProvider: AgentProvider {
 
                         let finishReason = choice["finish_reason"] as? String
                         let delta = choice["delta"] as? [String: Any] ?? [:]
+                        if choice["server_tool_event"] is [String: Any] { continuation.yield(.streamActivity) }
 
                         // Reasoning content from thinking models via dedicated fields.
                         // Preserve empty strings — DeepSeek V4 emits them legitimately
@@ -526,6 +571,12 @@ final class OpenAIAgentProvider: AgentProvider {
                             }
                         }
 
+                        if self.model.nativeWebEnabled == true, self.isDeepSeekWebEndpoint,
+                           let progress = choice["server_tool_event"] as? [String: Any],
+                           progress["type"] as? String == "step_reasoning_done" {
+                            lastWebStepReasoningStart = reasoningContent.endIndex
+                        }
+
                         // Finish reason
                         // [T-intern-s2-empty-finish-reason] Some providers
                         // (e.g. intern-s2-preview) send `"finish_reason": ""` on
@@ -539,6 +590,18 @@ final class OpenAIAgentProvider: AgentProvider {
                             // Flush the think parser's tail (idempotent — the
                             // [DONE] handler may flush again harmlessly).
                             emitParsed(thinkParser.finishTurn())
+                            let urls = self.model.nativeWebEnabled == true ? (delta["annotations"] as? [[String: Any]] ?? []).compactMap(Self.citationURL) : []
+                            if !urls.isEmpty {
+                                emitParsed(("", "\n\n" + urls.map { "<\($0)>" }.joined(separator: " ")))
+                            }
+                            if self.isDeepSeekWebEndpoint, self.model.nativeWebEnabled == true,
+                               let calls = delta["server_tool_calls"] as? [[String: Any]],
+                               let replay = Self.replayJSON(calls) {
+                                var echo = ReasoningEcho(providerKind: "deepseek-chat", modelId: self.model.id,
+                                                         upstreamIdentity: self.reasoningUpstreamIdentity, items: [])
+                                echo.nativeWebReplay = replay
+                                continuation.yield(.reasoningEcho(echo))
+                            }
                             logger.info("SSE finish_reason=\(fr) hasToolCalls=\(hasToolCalls) emittedTextStart=\(emittedTextStart) reasoningLen=\(reasoningContent.count) encryptedReasoningChunks=\(encryptedReasoningChunks)")
                             // Emit completed tool calls
                             for (_, entry) in toolCallAccum.sorted(by: { $0.key < $1.key }) {
@@ -557,7 +620,7 @@ final class OpenAIAgentProvider: AgentProvider {
                             // string (DeepSeek V4) so the assistant turn round-trips an
                             // empty `reasoning_content` instead of nil → placeholder.
                             if sawReasoningFieldEver || !reasoningContent.isEmpty {
-                                continuation.yield(.reasoningContent(reasoningContent))
+                                continuation.yield(.reasoningContent(String(reasoningContent[(lastWebStepReasoningStart ?? reasoningContent.startIndex)...])))
                             }
 
                             let reason: AgentStopReason
@@ -604,7 +667,7 @@ final class OpenAIAgentProvider: AgentProvider {
         thinkingLevel: ThinkingLevel = .off
     ) async throws -> AsyncThrowingStream<AgentStreamEvent, Error> {
         let inputMessages = convertMessagesResponsesAPI(messages)
-        let responsesTools = convertToolsResponsesAPI(tools)
+        let responsesTools = convertToolsResponsesAPI(tools) + nativeWebTools(responses: true)
 
         let isCodexOAuth = !provider.forceResponsesAPI && provider.isOAuth && provider.customBaseURL == nil
 
@@ -700,6 +763,9 @@ final class OpenAIAgentProvider: AgentProvider {
         if let sys = systemPrompt, !sys.isEmpty {
             body["instructions"] = sys
         }
+        if model.nativeWebEnabled == true, isDeepSeekWebEndpoint, !thinkingLevel.isEnabled {
+            body["reasoning"] = ["effort": "none"]
+        }
         if !responsesTools.isEmpty {
             body["tools"] = responsesTools
             body["tool_choice"] = "auto"
@@ -780,6 +846,7 @@ final class OpenAIAgentProvider: AgentProvider {
                 // item — deltas reference items by `item_id` on the event payload,
                 // but a defensive fallback in case the field is absent.
                 var currentReasoningItemId: String? = nil
+                var citationURLs: [String] = []
 
                 do {
                     for try await line in lineStream {
@@ -811,6 +878,11 @@ final class OpenAIAgentProvider: AgentProvider {
                                 }
                             }
 
+                        case "response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed":
+                            continuation.yield(.streamActivity)
+                        case "response.output_text.annotation.added":
+                            if self.model.nativeWebEnabled == true, let annotation = event["annotation"] as? [String: Any], let url = Self.citationURL(annotation),
+                               !citationURLs.contains(url) { citationURLs.append(url) }
                         case "response.output_text.delta":
                             if !emittedTextStart {
                                 continuation.yield(.contentBlockStart(.text))
@@ -948,6 +1020,20 @@ final class OpenAIAgentProvider: AgentProvider {
 
                             // Check for reasoning items in output and log reasoning token usage
                             let outputItems = (response?["output"] as? [[String: Any]]) ?? []
+                            if self.model.nativeWebEnabled == true {
+                                for item in outputItems {
+                                    for part in item["content"] as? [[String: Any]] ?? [] {
+                                        for url in (part["annotations"] as? [[String: Any]] ?? []).compactMap(Self.citationURL)
+                                            where !citationURLs.contains(url) { citationURLs.append(url) }
+                                    }
+                                }
+                            }
+                            if !citationURLs.isEmpty {
+                                continuation.yield(.textDelta("\n\n" + citationURLs.map { "<\($0)>" }.joined(separator: " ")))
+                            }
+                            let webReplay = self.isDeepSeekWebEndpoint && self.model.nativeWebEnabled == true &&
+                                outputItems.contains { $0["type"] as? String == "web_search_call" }
+                                ? Self.replayJSON(outputItems.filter { ["web_search_call", "reasoning"].contains($0["type"] as? String ?? "") }) : nil
                             let reasoningItems = outputItems.filter { ($0["type"] as? String) == "reasoning" }
                             let usage = response?["usage"] as? [String: Any]
                             let reasoningTokens = (usage?["output_tokens_details"] as? [String: Any])?["reasoning_tokens"] as? Int ?? 0
@@ -998,7 +1084,7 @@ final class OpenAIAgentProvider: AgentProvider {
                             // convertMessagesResponsesAPI rather than replaying a
                             // blob that endpoint cannot decrypt.
                             // See ReasoningEcho for the isolation contract.
-                            if !reasoningItems.isEmpty {
+                            if !reasoningItems.isEmpty || webReplay != nil {
                                 let captured: [ReasoningEcho.Item] = reasoningItems.compactMap { item in
                                     guard let id = item["id"] as? String else { return nil }
                                     let encrypted = item["encrypted_content"] as? String
@@ -1023,8 +1109,8 @@ final class OpenAIAgentProvider: AgentProvider {
                                     // so this is a frequent shape, not a rare one.
                                     return .openaiReasoning(id: id, encryptedContent: encrypted, summary: summary)
                                 }
-                                if !captured.isEmpty {
-                                    let echo = ReasoningEcho(
+                                if !captured.isEmpty || webReplay != nil {
+                                    var echo = ReasoningEcho(
                                         providerKind: Self.responsesAPIProviderKind,
                                         modelId: self.model.id,
                                         // [T-responses-reasoning-inherit issue #368]
@@ -1034,6 +1120,7 @@ final class OpenAIAgentProvider: AgentProvider {
                                         upstreamIdentity: self.reasoningUpstreamIdentity,
                                         items: captured
                                     )
+                                    echo.nativeWebReplay = webReplay
                                     continuation.yield(.reasoningEcho(echo))
                                 }
                             }
@@ -1840,6 +1927,7 @@ final class OpenAIAgentProvider: AgentProvider {
     ) -> [String: Any] {
         let role = msg.role == .user ? "user" : "assistant"
         var result: [String: Any] = ["role": role]
+        if let calls = nativeReplay(msg, kind: "deepseek-chat") { result["server_tool_calls"] = calls }
 
         // Reasoning-content echo. Split into two independent paths so a
         // captured value always round-trips even when the *current*
@@ -1997,17 +2085,24 @@ final class OpenAIAgentProvider: AgentProvider {
         }
 
         for msg in messages {
+            // Provider-owned reasoning and web steps precede this turn's current
+            // text and local calls, which may have been edited or compacted.
+            let webSteps = nativeReplay(msg, kind: Self.responsesAPIProviderKind)
+            if let webSteps {
+                flushImageCarriers()
+                result.append(contentsOf: webSteps)
+            }
             /// [T-responses-reasoning-inherit issue #368] Whether this assistant
             /// turn already put a reasoning item on the wire. Drives the
             /// placeholder below, which only fires for a turn that carries tool
             /// calls and has nothing to replay.
-            var emittedReasoningForTurn = false
+            var emittedReasoningForTurn = webSteps?.contains { $0["type"] as? String == "reasoning" } ?? false
             // Replay native reasoning items at the head of this assistant turn.
             // Order matters: Responses API rejects reasoning items that appear
             // after function_call items belonging to the same turn. Cross-model
             // and cross-family payloads are stripped — encrypted_content is
             // model-specific and meaningless (often 400-inducing) elsewhere.
-            if msg.role == .assistant,
+            if webSteps == nil, msg.role == .assistant,
                let echo = msg.reasoningEcho,
                echo.providerKind == Self.responsesAPIProviderKind {
                 // [T-responses-reasoning-inherit issue #368] Replay the blob only

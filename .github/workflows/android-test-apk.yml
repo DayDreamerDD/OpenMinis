@@ -1,0 +1,81 @@
+name: Android test APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      NDK_VERSION: 28.0.12433566
+      BUILD_TOOLS: 36.0.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: deps/rclone-mobile/go.mod
+          cache: false
+
+      - name: Install Android build tools
+        run: |
+          sdkmanager "platforms;android-36" "build-tools;$BUILD_TOOLS" "cmake;3.22.1" "ndk;$NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Build the sandbox and rclone
+        run: |
+          git submodule update --init --recursive -- deps/proot
+          bash deps/build_proot.sh
+          bash scripts/prepare_android_sandbox.sh
+          mobile=$(cd deps/rclone-mobile && go list -m -f '{{.Version}}' golang.org/x/mobile)
+          go install "golang.org/x/mobile/cmd/gomobile@$mobile"
+          go install "golang.org/x/mobile/cmd/gobind@$mobile"
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gomobile init
+          bash deps/build_rclone_android.sh
+          install -Dm644 deps/build/rclone/rclone.aar src/android/app/libs/rclone.aar
+
+      - name: Assemble GitHub debug APK
+        working-directory: src/android
+        run: ./gradlew --no-daemon :app:assembleGithubDebug
+
+      - name: Sign and verify the APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.AEGLESEEKER_KEYSTORE_BASE64 }}
+          SIGNING_PASSWORD: ${{ secrets.AEGLESEEKER_SIGNING_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${KEYSTORE_BASE64:?Set AEGLESEEKER_KEYSTORE_BASE64 in Actions secrets}"
+          : "${SIGNING_PASSWORD:?Set AEGLESEEKER_SIGNING_PASSWORD in Actions secrets}"
+          umask 077
+          keystore=$(mktemp "$RUNNER_TEMP/aegleseeker.XXXXXX")
+          trap 'rm -f -- "$keystore"' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          unset KEYSTORE_BASE64
+          signer="$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner"
+          apk="$RUNNER_TEMP/OpenMinis-test-arm64.apk"
+          "$signer" sign --ks "$keystore" --ks-key-alias Aegleseeker \
+            --ks-pass env:SIGNING_PASSWORD --key-pass env:SIGNING_PASSWORD \
+            --out "$apk" src/android/app/build/outputs/apk/github/debug/app-github-debug.apk
+          certs=$("$signer" verify --verbose --print-certs "$apk")
+          digest=$(awk '/^Signer #[0-9]+ certificate SHA-256 digest:/ { print $NF }' <<< "$certs")
+          test "$digest" = '32b1530d8101fc7f6b545b2f8efa858155e22f285c89f28fdab7b0c4f42e3961'
+          printf 'Verified APK signer SHA-256: `%s`\n' "$digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenMinis-test-arm64
+          path: ${{ runner.temp }}/OpenMinis-test-arm64.apk
+          if-no-files-found: error
+          compression-level: 0

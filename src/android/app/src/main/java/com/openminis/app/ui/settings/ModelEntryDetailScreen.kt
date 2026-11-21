@@ -22,6 +22,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
+import com.openminis.app.provider.supportsNativeWeb
 import com.openminis.app.data.model.ModelOverrides
 import com.openminis.app.data.model.effectiveInputModalities
 import com.openminis.app.data.model.effectiveOutputModalities
@@ -75,6 +76,7 @@ fun ModelEntryDetailScreen(
     // only thing that distinguishes a deliberate choice from an untouched
     // default on a control with no empty state. See the save block below.
     var thinkingTouched by remember { mutableStateOf(false) }
+    var nativeWebEnabled by remember(entry.id) { mutableStateOf(overrides.nativeWebEnabled == true) }
     var isHidden by remember { mutableStateOf(entry.isHidden) }
     var showQuickTest by remember { mutableStateOf(false) }
 
@@ -157,6 +159,7 @@ fun ModelEntryDetailScreen(
                     }
                     val newOverrides = buildModelOverrides(
                         existing = overrides,
+                        nativeWebEnabled = true.takeIf { nativeWebEnabled },
                         displayNameText = displayName,
                         displayNameTouched = displayNameTouched,
                         maxOutputTokensText = maxOutputTokensText,
@@ -248,6 +251,13 @@ fun ModelEntryDetailScreen(
                         color = MaterialTheme.colorScheme.error.copy(alpha = 0.8f),
                     )
                 }
+            }
+            if (instance?.supportsNativeWeb(modelId) == true) {
+                SettingsSwitchRow(
+                    title = stringResource(R.string.model_entry_native_web),
+                    checked = nativeWebEnabled,
+                    onCheckedChange = { nativeWebEnabled = it },
+                )
             }
             SettingsSwitchRow(
                 title = stringResource(R.string.modeldetail_thinking),
@@ -410,7 +420,9 @@ internal fun buildModelOverrides(
     inputModalitiesTouched: Boolean,
     outputModalities: List<String>,
     outputModalitiesTouched: Boolean,
+    nativeWebEnabled: Boolean? = existing.nativeWebEnabled,
 ): ModelOverrides = ModelOverrides(
+    nativeWebEnabled = nativeWebEnabled,
     displayName = if (displayNameTouched) {
         displayNameText.trim().takeIf { it.isNotEmpty() }
     } else {

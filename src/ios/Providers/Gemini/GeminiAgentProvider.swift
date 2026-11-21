@@ -90,6 +90,12 @@ final class GeminiAgentProvider: AgentProvider {
                             // Gemini delivers complete function calls at once (no streaming partial JSON)
                             continuation.yield(.toolCallComplete(id: id, name: name, args: args, metadata: metadata))
 
+                        case .nativeWebReplay(let replay):
+                            var echo = ReasoningEcho(providerKind: "gemini", modelId: self.model.id,
+                                                     upstreamIdentity: self.provider.nativeWebUpstream, items: [])
+                            echo.nativeWebReplay = replay
+                            continuation.yield(.reasoningEcho(echo))
+
                         case .usage(let u):
                             continuation.yield(.usage(u))
 
@@ -174,8 +180,47 @@ final class GeminiAgentProvider: AgentProvider {
         // perfectly well.
         let requiresSig = model.id.lowercased().contains("gemini-3")
         var unsignedToolCallIds: Set<String> = []
+        var replayByIndex: [Int: [[String: Any]]] = [:]
+        var wireCallIDs: [String: String] = [:]
+        for (index, msg) in messages.enumerated() {
+            guard msg.role == .assistant, let echo = msg.reasoningEcho,
+                  let replay = echo.nativeWebReplay else { continue }
+            let calls = msg.parts.compactMap { part -> (String, String, [String: Any], Bool)? in
+                if case .toolUse(let id, let name, let input, let offloaded) = part { return (id, name, input, offloaded) }
+                return nil
+            }
+            guard model.nativeWebEnabled == true, echo.providerKind == "gemini",
+                  echo.modelId == model.id, echo.upstreamIdentity == provider.nativeWebUpstream,
+                  let archive = (try? JSONSerialization.jsonObject(with: Data(replay.utf8))) as? [String: Any],
+                  let raw = archive["parts"] as? [[String: Any]],
+                  !raw.isEmpty else {
+                unsignedToolCallIds.formUnion(calls.map { $0.0 })
+                continue
+            }
+            let functions = raw.compactMap { $0["functionCall"] as? [String: Any] }
+            let texts = msg.parts.compactMap { part -> String? in
+                if case .text(let text) = part { return text }
+                return nil
+            }
+            let archivedText = raw.filter { $0["thought"] as? Bool != true }.compactMap { $0["text"] as? String }.joined()
+            guard calls.count + texts.count == msg.parts.count,
+                  archivedText + (archive["sourceText"] as? String ?? "") == texts.joined(),
+                  functions.count == calls.count,
+                  zip(functions, calls).allSatisfy({ function, call in
+                      guard !call.3, function["name"] as? String == call.1 else { return false }
+                      let args = function["args"] as? [String: Any] ?? [:]
+                      guard let archived = try? JSONSerialization.data(withJSONObject: args, options: .sortedKeys),
+                            let current = try? JSONSerialization.data(withJSONObject: call.2, options: .sortedKeys) else { return false }
+                      return archived == current
+                  }) else {
+                unsignedToolCallIds.formUnion(calls.map { $0.0 })
+                continue
+            }
+            replayByIndex[index] = raw
+            for (call, function) in zip(calls, functions) { wireCallIDs[call.0] = function["id"] as? String }
+        }
         if requiresSig {
-            for msg in messages {
+            for (index, msg) in messages.enumerated() where replayByIndex[index] == nil {
                 var idsInMessage: [String] = []
                 var anyUnsigned = false
                 for part in msg.parts {
@@ -191,7 +236,8 @@ final class GeminiAgentProvider: AgentProvider {
             }
         }
 
-        return messages.map { msg in
+        return messages.enumerated().map { index, msg in
+            if let replay = replayByIndex[index] { return ["role": "model", "parts": replay] }
             let role = msg.role == .user ? "user" : "model"
             var parts: [[String: Any]] = []
 
@@ -230,10 +276,11 @@ final class GeminiAgentProvider: AgentProvider {
                     } else {
                         // [T-gemini-empty-part-oneof-400] Never ship an empty
                         // result string into the functionResponse payload.
-                        parts.append(GeminiConversation.functionResponsePart(
-                            name: resolvedName,
-                            response: GeminiWireFormat.functionResponseResult(content)
-                        ))
+                        var response: [String: Any] = [
+                            "name": resolvedName, "response": GeminiWireFormat.functionResponseResult(content)
+                        ]
+                        response["id"] = wireCallIDs[id]
+                        parts.append(["functionResponse": response])
                         if let data = imageData {
                             let mime = imageMimeType ?? "image/jpeg"
                             parts.append(["inlineData": ["mimeType": mime, "data": data.base64EncodedString()]])

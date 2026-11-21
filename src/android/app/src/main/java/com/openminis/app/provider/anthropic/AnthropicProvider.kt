@@ -19,6 +19,7 @@ import com.openminis.app.provider.safeOptString
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.withContext
@@ -132,8 +133,9 @@ class AnthropicProvider(
         imageParts: List<LLMMessage.ImagePart>,
         tools: List<AgentToolDefinition>,
         thinkingLevel: ThinkingLevel,
+        nativeWebEnabled: Boolean,
     ): Flow<LLMStreamChunk> = rawStreamMessage(
-        messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel,
+        messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel, nativeWebEnabled,
     ).failOnSilentEmptyCompletion(name)
 
     private fun rawStreamMessage(
@@ -144,8 +146,25 @@ class AnthropicProvider(
         imageParts: List<LLMMessage.ImagePart>,
         tools: List<AgentToolDefinition>,
         thinkingLevel: ThinkingLevel,
-    ): Flow<LLMStreamChunk> = callbackFlow {
-        val body = buildRequestBody(messages, systemPrompt, maxTokens, stream = true, temperature = temperature, imageParts = imageParts, tools = tools, thinkingLevel = thinkingLevel)
+        nativeWebEnabled: Boolean,
+    ): Flow<LLMStreamChunk> {
+        val body = buildRequestBody(messages, systemPrompt, maxTokens, stream = true, temperature = temperature, imageParts = imageParts, tools = tools, thinkingLevel = thinkingLevel, nativeWebEnabled = nativeWebEnabled)
+        val nativeWeb = nativeWebEnabled && AnthropicWebTools.addTo(body, basePath, model.id)
+        return streamBody(body, nativeWeb, 0)
+    }
+
+    private fun streamBody(body: JSONObject, nativeWeb: Boolean, pauses: Int, preceding: JSONArray = JSONArray(),
+                           rendered: StringBuilder = StringBuilder(), previousUsage: JSONObject = JSONObject()): Flow<LLMStreamChunk> = callbackFlow {
+        val replay = if (nativeWeb) AnthropicWebBlocks(body.getJSONArray("messages")) else null
+        var paused = false
+        var receivedStopReason = false
+        val currentUsage = JSONObject()
+        var cumulativeUsage = previousUsage
+        fun streamUsage(update: JSONObject): LLMUsage {
+            if (!nativeWeb) return parseUsage(update)
+            cumulativeUsage = AnthropicWebTools.usage(previousUsage, currentUsage, update)
+            return parseUsage(cumulativeUsage).copy(latestContextTokens = parseUsage(currentUsage).latestContextTokens)
+        }
         // T302: serialize the body exactly once and pass the string to
         // buildRequest. Pre-T302 body.toString() ran twice per call (once
         // here, once inside buildRequest); each emitted string was tens of
@@ -209,6 +228,7 @@ class AnthropicProvider(
         var currentToolId: String? = null
         var currentToolName: String? = null
         val toolInputBuffer = StringBuilder()
+        var initialToolInput: JSONObject? = null
 
         try {
             var line: String?
@@ -238,19 +258,31 @@ class AnthropicProvider(
                 }
                 val eventType = event.safeOptString("type", "")
 
+                replay?.accept(event)?.let { link ->
+                    rendered.append(link)
+                    send(LLMStreamChunk.Text(link))
+                }
                 when (eventType) {
                     "message_start" -> {
                         send(LLMStreamChunk.Started)
                         event.optJSONObject("message")?.optJSONObject("usage")?.let { usage ->
-                            send(LLMStreamChunk.Usage(parseUsage(usage)))
+                            send(LLMStreamChunk.Usage(streamUsage(usage)))
                         }
                     }
                     "content_block_start" -> {
                         val contentBlock = event.optJSONObject("content_block")
+                        if (nativeWeb && contentBlock?.optString("type") == "text") {
+                            val initial = contentBlock.optString("text")
+                            if (initial.isNotEmpty()) {
+                                rendered.append(initial)
+                                send(LLMStreamChunk.Text(initial))
+                            }
+                        }
                         if (contentBlock?.safeOptString("type", "") == "tool_use") {
                             currentToolId = contentBlock.safeOptString("id", "")
                             currentToolName = contentBlock.safeOptString("name", "")
                             toolInputBuffer.clear()
+                            initialToolInput = contentBlock.optJSONObject("input")
                             android.util.Log.d("ToolChain[Provider]", "→ ToolUseStart id=$currentToolId name=$currentToolName")
                             send(LLMStreamChunk.ToolUseStart(currentToolId!!, currentToolName!!))
                         }
@@ -260,6 +292,7 @@ class AnthropicProvider(
                         when (delta.safeOptString("type", "")) {
                             "text_delta" -> {
                                 val text = delta.safeOptString("text", "")
+                                if (replay != null) rendered.append(text)
                                 if (text.isNotEmpty()) send(LLMStreamChunk.Text(text))
                             }
                             "thinking_delta" -> {
@@ -282,7 +315,8 @@ class AnthropicProvider(
                     "content_block_stop" -> {
                         if (currentToolId != null && currentToolName != null) {
                             val args = try {
-                                JSONObject(toolInputBuffer.toString())
+                                if (toolInputBuffer.isEmpty()) initialToolInput ?: JSONObject()
+                                else JSONObject(toolInputBuffer.toString())
                             } catch (_: Exception) {
                                 JSONObject()
                             }
@@ -295,19 +329,30 @@ class AnthropicProvider(
                     }
                     "message_delta" -> {
                         event.optJSONObject("usage")?.let { usage ->
-                            send(LLMStreamChunk.Usage(parseUsage(usage)))
+                            send(LLMStreamChunk.Usage(streamUsage(usage)))
                         }
                         val delta = event.optJSONObject("delta")
                         val stopReason = delta?.safeOptString("stop_reason", "")?.ifEmpty { null }
                         // [FIX-261018-12] A refusal's stop_details says why
                         // (category "cyber", the policy explanation).
                         val details = if (stopReason == "refusal") delta?.optJSONObject("stop_details") else null
+                        if (stopReason != null) receivedStopReason = true
+                        if (nativeWeb && stopReason == "pause_turn") {
+                            paused = true
+                            continue
+                        }
                         send(LLMStreamChunk.Finished(
                             stopReason,
+                            nativeWebReplay = replay?.let {
+                                if (it.usedWeb || preceding.length() > 0) {
+                                    AnthropicWebTools.encodeReplay(basePath, model.id, preceding, it.content, rendered.toString())
+                                } else null
+                            },
                             refusalCategory = details?.safeOptString("category", "")?.ifEmpty { null },
                             refusalExplanation = details?.safeOptString("explanation", "")?.ifEmpty { null },
                         ))
                     }
+                    "message_stop" -> if (nativeWeb) break
                     // [T-android-fallback-providererror] Anthropic can emit an
                     // `error` frame MID-STREAM (overloaded_error, rate-limit,
                     // an invalidated key) after tokens have already flowed.
@@ -344,11 +389,21 @@ class AnthropicProvider(
                     }
                 }
             }
+            if (nativeWeb && !receivedStopReason) {
+                throw LLMError.TransientError("Anthropic stream ended before its stop reason")
+            }
         } catch (e: Exception) {
+            if (nativeWeb) throw mapError(e)
             cancel("Stream error", mapError(e))
         } finally {
             reader.close()
             response.close()
+        }
+        if (paused && replay != null) {
+            if (pauses >= 8 || replay.content.length() == 0) throw LLMError.ProviderError("Anthropic web tool continuation limit reached")
+            body.getJSONArray("messages").put(JSONObject().put("role", "assistant").put("content", replay.content))
+            for (i in 0 until replay.content.length()) preceding.put(replay.content.get(i))
+            streamBody(body, nativeWeb, pauses + 1, preceding, rendered, cumulativeUsage).collect { send(it) }
         }
         channel.close()
         awaitClose()
@@ -413,6 +468,7 @@ class AnthropicProvider(
         // [T-android-thinking-level-arch] Already clamped to the model ceiling by
         // LLMProvider.streamMessage/sendMessage before reaching here.
         thinkingLevel: ThinkingLevel = ThinkingLevel.OFF,
+        nativeWebEnabled: Boolean = false,
     ): JSONObject {
         val body = JSONObject()
         body.put("model", model.id)
@@ -534,7 +590,7 @@ class AnthropicProvider(
         }
 
         // Build and merge messages
-        val rawMessages = buildMessages(messages, imageParts)
+        val rawMessages = buildMessages(messages, imageParts, nativeWebEnabled)
         val merged = mergeConsecutiveSameRole(rawMessages)
 
         // Inject cache_control on last 2 user messages
@@ -640,6 +696,7 @@ class AnthropicProvider(
     private fun buildMessages(
         rawMessages: List<LLMMessage>,
         imageParts: List<LLMMessage.ImagePart>,
+        nativeWebEnabled: Boolean,
     ): JSONArray {
         // Sanitize orphan tool_results before serialization. Operates on a
         // copy — caller's stored history is untouched.
@@ -654,6 +711,12 @@ class AnthropicProvider(
             val obj = JSONObject()
             obj.put("role", msg.role.value)
 
+            val replay = if (nativeWebEnabled && msg.role == LLMMessage.Role.ASSISTANT)
+                AnthropicWebTools.restore(msg, basePath, model.id) else null
+            if (replay != null) {
+                messagesArray.put(obj.put("content", replay))
+                continue
+            }
             if (msg.contentParts.isNotEmpty()) {
                 val contentArray = JSONArray()
                 // [T-android-anthropic-thinking-echo] (issue #70) Prepend the
@@ -821,7 +884,9 @@ class AnthropicProvider(
                 // messages merge (T-android-anthropic-thinking-echo, issue #70)
                 // this hoists every synthesized thinking block ahead of the text
                 // so the merged turn still leads with thinking.
-                if (role == "assistant") {
+                // A native Messages transcript includes signed blocks in their
+                // original order. Reordering those can invalidate the replay.
+                if (role == "assistant" && contentBlocks.none { it.optString("type") == "server_tool_use" }) {
                     val thinking = contentBlocks.filter { it.optString("type") == "thinking" }
                     val other = contentBlocks.filter {
                         val t = it.optString("type")

@@ -41,7 +41,8 @@ extension AIChatViewModel {
         noteProviderIdentity(for: entry)  // [T-provider-live-check]
         let provider = await Self.makeAgentProvider(
             for: entry,
-            resolveSessionId: { box.value }
+            resolveSessionId: { box.value },
+            ordinaryChat: true
         )
         applyPendingThoughtSignatures(to: provider)
         return provider
@@ -87,7 +88,8 @@ extension AIChatViewModel {
     /// is resolved per request rather than captured at construction.
     static func makeAgentProvider(
         for entry: ModelEntry,
-        resolveSessionId: @escaping @Sendable () -> String?
+        resolveSessionId: @escaping @Sendable () -> String?,
+        ordinaryChat: Bool = false
     ) async -> AgentProvider {
         let store = ProviderConfigStore.shared
         guard let instance = store.instance(for: entry.providerInstanceId) else {
@@ -108,19 +110,22 @@ extension AIChatViewModel {
             }
             return LLMProviderFactory.applyModelOverrides(p, entry: entry)
         }
+        var chatModel = entry.model
+        chatModel.nativeWebEnabled = ordinaryChat && instance.supportsNativeWeb(modelID: chatModel.id)
+            ? entry.overrides.nativeWebEnabled : nil
         switch instance.providerType {
         case .anthropic:
-            return AnthropicAgentProvider(provider: LLMProviderFactory.makeAnthropicProvider(instance: instance, model: entry.model))
+            return AnthropicAgentProvider(provider: LLMProviderFactory.makeAnthropicProvider(instance: instance, model: chatModel))
         case .gemini:
-            return GeminiAgentProvider(provider: await LLMProviderFactory.makeGeminiProvider(instance: instance, model: entry.model))
+            return GeminiAgentProvider(provider: await LLMProviderFactory.makeGeminiProvider(instance: instance, model: chatModel))
         case .openAI:
-            return OpenAIAgentProvider(provider: wrap(LLMProviderFactory.makeOpenAIProvider(instance: instance, model: entry.model)))
+            return OpenAIAgentProvider(provider: wrap(LLMProviderFactory.makeOpenAIProvider(instance: instance, model: chatModel)))
         case .antigravity:
             return AntigravityAgentProvider(provider: await LLMProviderFactory.makeAntigravityProvider(instance: instance, model: entry.model))
         case .openRouter:
             return OpenAIAgentProvider(provider: wrap(LLMProviderFactory.makeOpenRouterProvider(instance: instance, model: entry.model)))
         case .openAIResponses:
-            return OpenAIAgentProvider(provider: wrap(LLMProviderFactory.makeOpenAIResponsesProvider(instance: instance, model: entry.model)))
+            return OpenAIAgentProvider(provider: wrap(LLMProviderFactory.makeOpenAIResponsesProvider(instance: instance, model: chatModel)))
         case .xAI:
             return OpenAIAgentProvider(provider: wrap(LLMProviderFactory.makeXAIProvider(instance: instance, model: entry.model)))
         case .kimiCode:

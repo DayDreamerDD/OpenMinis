@@ -82,9 +82,10 @@ interface LLMProvider {
         imageParts: List<LLMMessage.ImagePart> = emptyList(),
         tools: List<AgentToolDefinition> = emptyList(),
         thinkingLevel: ThinkingLevel = ThinkingLevel.OFF,
+        nativeWebEnabled: Boolean = false,
     ): Flow<LLMStreamChunk> = streamMessageClamped(
         messages, systemPrompt, maxTokens, temperature, imageParts, tools,
-        clampThinkingLevel(thinkingLevel),
+        clampThinkingLevel(thinkingLevel), nativeWebEnabled,
     )
 
     /**
@@ -112,6 +113,7 @@ interface LLMProvider {
         imageParts: List<LLMMessage.ImagePart>,
         tools: List<AgentToolDefinition>,
         thinkingLevel: ThinkingLevel,
+        nativeWebEnabled: Boolean = false,
     ): Flow<LLMStreamChunk>
 
     /**

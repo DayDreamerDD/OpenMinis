@@ -15,6 +15,7 @@ sealed class LLMStreamChunk {
         val stopReason: String?,
         val refusalCategory: String? = null,
         val refusalExplanation: String? = null,
+        val nativeWebReplay: String? = null,
     ) : LLMStreamChunk()
 
     /** Thinking/reasoning streaming event */

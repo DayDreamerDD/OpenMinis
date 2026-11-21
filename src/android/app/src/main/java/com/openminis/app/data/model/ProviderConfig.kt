@@ -429,6 +429,7 @@ data class ModelOverrides(
     val customHeaders: Map<String, String>? = null,
     /** Raw JSON merged into the request body for provider-specific knobs. */
     val extraBodyParams: JsonObject? = null,
+    val nativeWebEnabled: Boolean? = null,
 ) {
     val isEmpty: Boolean
         get() = displayName == null
@@ -446,6 +447,7 @@ data class ModelOverrides(
             && temperature == null
             && topP == null
             && customHeaders == null
+            && nativeWebEnabled == null
             && extraBodyParams == null
 }
 

@@ -60,6 +60,7 @@ final class AntigravityAgentProvider: AgentProvider {
                 do {
                     for try await event in stream {
                         switch event {
+                        case .nativeWebReplay: break
                         case .textDelta(let text):
                             if !emittedTextStart {
                                 continuation.yield(.contentBlockStart(.text))

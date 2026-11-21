@@ -59,7 +59,26 @@ final class AnthropicAgentProvider: AgentProvider {
         #if DEBUG
         AgentRequestTrace.shared.step("anthropic.convertMessages", detail: "input messages=\(messages.count)")
         #endif
-        let anthropicMessages = convertMessages(messages)
+        let nativeTools = model.nativeWebEnabled == true
+            ? AnthropicWebTools.declarations(base: provider.nativeWebBase, model: model.id) : []
+        var replay: [String: [[String: Any]]] = [:]
+        let markedMessages = messages.map { message -> AgentMessage in
+            guard message.role == .assistant, !nativeTools.isEmpty, let echo = message.reasoningEcho,
+                  echo.providerKind == "anthropic-messages", echo.modelId == self.model.id,
+                  echo.upstreamIdentity == self.provider.nativeWebBase,
+                  let raw = echo.nativeWebReplay,
+                  let archive = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+                  let blocks = archive["blocks"] as? [[String: Any]],
+                  let rendered = archive["text"] as? String,
+                  AnthropicWebTools.matches(message, blocks: blocks, rendered: rendered)
+            else { return message }
+            let marker = UUID().uuidString
+            replay[marker] = blocks
+            var marked = message
+            marked.parts = [.text(marker)] + message.parts + [.text(marker)]
+            return marked
+        }
+        let anthropicMessages = convertMessages(markedMessages)
         let anthropicTools = convertTools(tools)
         let cachedMessages = messagesWithCacheBreakpoints(anthropicMessages)
 
@@ -217,6 +236,9 @@ final class AnthropicAgentProvider: AgentProvider {
         // path stays terminal. Only transient NSURLError codes are retried; auth
         // (401), rate-limit (429), 4xx/5xx and any non-network error fall straight
         // through to mapError() → group fallback, unchanged. [diag-0800 Q2 / -1005]
+        if !nativeTools.isEmpty {
+            return try nativeWebStream(parameter: parameter, tools: nativeTools, replay: replay, thinking: thinkingLevel)
+        }
         let stream: AsyncThrowingStream<MessageStreamResponse, Error>
         var establishAttempt = 0
         while true {
@@ -1224,3 +1246,308 @@ extension AnthropicAgentProvider {
     }
 }
 // END AnthropicRequestBody
+
+// Raw Messages events carry provider-specific signed content that the SDK's narrowed
+// content models cannot round-trip. Ordinary requests keep the SDK stream.
+enum AnthropicWebTools {
+    static func recordDocument(_ block: [String: Any], in documents: inout [String?]) {
+        if block["type"] as? String == "document" {
+            documents.append(nil)
+        } else if block["type"] as? String == "web_fetch_tool_result",
+                  let result = block["content"] as? [String: Any],
+                  let document = result["content"] as? [String: Any], document["type"] as? String == "document" {
+            documents.append(result["url"] as? String)
+        }
+    }
+
+    static func matches(_ message: AgentMessage, blocks: [[String: Any]], rendered: String) -> Bool {
+        guard !message.isInterrupted else { return false }
+        var visible = ""
+        var calls: [[String: Any]] = []
+        for part in message.parts {
+            switch part {
+            case .text(let text): visible += text
+            case .toolUse(let id, let name, let input, let offloaded):
+                if offloaded { return false }
+                calls.append(["id": id, "name": name, "input": input])
+            default: return false
+            }
+        }
+        let originalCalls = blocks.filter { $0["type"] as? String == "tool_use" }.map {
+            ["id": $0["id"], "name": $0["name"], "input": $0["input"]].compactMapValues { $0 }
+        }
+        return visible.trimmingCharacters(in: .whitespacesAndNewlines) == rendered.trimmingCharacters(in: .whitespacesAndNewlines)
+            && NSArray(array: calls).isEqual(to: originalCalls)
+    }
+
+    static func restoreHistory(_ history: inout [[String: Any]], replay: [String: [[String: Any]]]) {
+        for i in history.indices where history[i]["role"] as? String == "assistant" {
+            guard let blocks = history[i]["content"] as? [[String: Any]],
+                  blocks.contains(where: { replay[$0["text"] as? String ?? ""] != nil }) else { continue }
+            // convertMessages moves local tool_use blocks to the end of a merged
+            // assistant turn. Original calls restored from raw content replace
+            // those copies even when they moved beyond the closing text marker.
+            let restoredToolIDs = Set(blocks.compactMap { $0["text"] as? String }
+                .compactMap { replay[$0] }.flatMap { $0 }
+                .filter { $0["type"] as? String == "tool_use" }
+                .compactMap { $0["id"] as? String })
+            var closingMarker: String?
+            history[i]["content"] = blocks.flatMap { block -> [[String: Any]] in
+                // A compat proxy's synthesized unsigned thinking precedes the placeholder.
+                if block["type"] as? String == "thinking", block["signature"] == nil { return [] }
+                if block["type"] as? String == "tool_use", let id = block["id"] as? String,
+                   restoredToolIDs.contains(id) { return [] }
+                let text = block["text"] as? String
+                if let closing = closingMarker {
+                    if closing == text { closingMarker = nil }
+                    return []
+                }
+                if let text, let original = replay[text] {
+                    closingMarker = text
+                    return original
+                }
+                return [block]
+            }
+        }
+    }
+
+    static func declarations(base: String, model: String) -> [[String: Any]] {
+        if URL(string: base)?.host?.lowercased() == "api.deepseek.com" {
+            guard model == "deepseek-flash" else { return [] }
+            return ["deepseek_web_search", "deepseek_read_url"].map { ["type": $0, "name": $0] }
+        }
+        return [
+            ["type": "web_search_20250305", "name": "web_search"],
+            ["type": "web_fetch_20250910", "name": "web_fetch", "citations": ["enabled": true]]
+        ]
+    }
+}
+
+extension AnthropicAgentProvider {
+    private static func openNativeWebStream(session: URLSession, request: URLRequest) async throws
+        -> (URLSession.AsyncBytes, URLResponse) {
+        var attempts = 0
+        while true {
+            do { return try await session.bytes(for: request) }
+            catch {
+                guard isTransientNetworkError(error), attempts < maxStreamConnectRetries else { throw error }
+                try Task.checkCancellation()
+                attempts += 1
+                try await Task.sleep(nanoseconds: UInt64(attempts) * 1_000_000_000)
+            }
+        }
+    }
+
+    private func nativeWebStream(parameter: MessageParameter, tools: [[String: Any]],
+                                 replay: [String: [[String: Any]]], thinking: ThinkingLevel) throws
+        -> AsyncThrowingStream<AgentStreamEvent, Error> {
+        guard let url = URL(string: provider.nativeWebBase)?.appendingPathComponent("v1/messages") else {
+            throw LLMError.providerError(message: "Invalid Anthropic Messages URL")
+        }
+        var parameter = parameter
+        parameter.stream = true
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let mutable = NSMutableURLRequest(url: url)
+        mutable.httpMethod = "POST"
+        mutable.setValue(provider.nativeWebKey, forHTTPHeaderField: "x-api-key")
+        mutable.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        mutable.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        mutable.httpBody = try encoder.encode(parameter)
+        if provider.isClaudeCode { RequestBodyPatcher.applyOAuthBodyPatches(to: mutable) }
+        else { RequestBodyPatcher.applyKeyAuthBodyPatches(to: mutable) }
+        mutable.setValue("1", forHTTPHeaderField: "X-Minis-Prepared-Messages")
+        guard let data = mutable.httpBody,
+              var body = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var history = body["messages"] as? [[String: Any]] else {
+            throw LLMError.providerError(message: "Invalid Anthropic Messages request")
+        }
+        let local = body["tools"] as? [[String: Any]] ?? []
+        let names = Set(local.compactMap { $0["name"] as? String })
+        body["tools"] = local + tools.filter { !names.contains($0["name"] as? String ?? "") }
+        AnthropicWebTools.restoreHistory(&history, replay: replay)
+        body["messages"] = history
+        mutable.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let base = provider.nativeWebBase
+        let modelID = model.id
+        let session = provider.nativeWebSession
+        let prepared = mutable as URLRequest
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard let initialBody = prepared.httpBody,
+                          var body = try JSONSerialization.jsonObject(with: initialBody) as? [String: Any],
+                          var history = body["messages"] as? [[String: Any]] else {
+                        throw LLMError.providerError(message: "Invalid Anthropic Messages request")
+                    }
+                    var allBlocks: [[String: Any]] = []
+                    var rendered = ""
+                    var reasoning = ""
+                    var usedWeb = false
+                    var previousUsage: [String: Int] = [:]
+                    for round in 0...8 {
+                        try Task.checkCancellation()
+                        var request = prepared
+                        if round > 0 {
+                            body["messages"] = history
+                            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                        }
+                        let (bytes, response) = try await Self.openNativeWebStream(session: session, request: request)
+                        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                        guard (200...299).contains(status) else {
+                            var detail = ""
+                            for try await line in bytes.lines {
+                                detail += String(line.prefix(2048))
+                                if detail.count >= 2048 { break }
+                            }
+                            switch status {
+                            case 401, 403: throw LLMError.invalidAPIKey(detail: detail)
+                            case 429: throw LLMError.rateLimited
+                            case 500...599: throw LLMError.transientError(message: detail, statusCode: status)
+                            default: throw LLMError.providerError(message: "HTTP \(status) \(detail)")
+                            }
+                        }
+                        var roundUsage: [String: Int] = [:]
+                        var blocks: [[String: Any]] = []
+                        var partial = ""
+                        var stop: String?
+                        var documents: [String?] = []
+                        for message in history {
+                            for block in message["content"] as? [[String: Any]] ?? [] {
+                                AnthropicWebTools.recordDocument(block, in: &documents)
+                            }
+                        }
+                        var links = Set<String>()
+                        readEvents: for try await line in bytes.lines where line.hasPrefix("data:") {
+                            try Task.checkCancellation()
+                            let data = Data(line.dropFirst(5).utf8)
+                            guard let event = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                            let idx = event["index"] as? Int ?? -1
+                            let delta = event["delta"] as? [String: Any] ?? [:]
+                            let message = event["message"] as? [String: Any]
+                            if let usage = (event["usage"] ?? message?["usage"]) as? [String: Any] {
+                                for key in ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"] {
+                                    if let value = usage[key] as? Int { roundUsage[key] = value }
+                                }
+                                let total = previousUsage.merging(roundUsage, uniquingKeysWith: +)
+                                continuation.yield(.usage(LLMUsage(inputTokens: total["input_tokens"] ?? 0,
+                                    outputTokens: total["output_tokens"] ?? 0,
+                                    cacheCreationInputTokens: total["cache_creation_input_tokens"],
+                                    cacheReadInputTokens: total["cache_read_input_tokens"])))
+                            }
+                            switch event["type"] as? String {
+                            case "message_start":
+                                if let id = message?["model"] as? String { continuation.yield(.responseModel(id)) }
+                            case "content_block_start":
+                                guard let block = event["content_block"] as? [String: Any], idx == blocks.count else {
+                                    throw LLMError.providerError(message: "Unexpected Anthropic content block index")
+                                }
+                                blocks.append(block)
+                                partial = ""
+                                switch block["type"] as? String {
+                                case "server_tool_use":
+                                    usedWeb = true
+                                    continuation.yield(.streamActivity)
+                                case "web_fetch_tool_result":
+                                    AnthropicWebTools.recordDocument(block, in: &documents)
+                                case "tool_use":
+                                    if let id = block["id"] as? String, let name = block["name"] as? String {
+                                        continuation.yield(.contentBlockStart(.toolUse(id: id, name: name)))
+                                    }
+                                case "text":
+                                    continuation.yield(.contentBlockStart(.text))
+                                    if let text = block["text"] as? String, !text.isEmpty {
+                                        rendered += text
+                                        continuation.yield(.textDelta(text))
+                                    }
+                                default: break
+                                }
+                            case "content_block_delta" where blocks.indices.contains(idx):
+                                switch delta["type"] as? String {
+                                case "text_delta", "thinking_delta", "signature_delta":
+                                    let key = String((delta["type"] as? String ?? "").dropLast(6))
+                                    let fragment = delta[key] as? String ?? ""
+                                    var value = blocks[idx].removeValue(forKey: key) as? String ?? ""
+                                    value.append(fragment)
+                                    blocks[idx][key] = value
+                                    if key == "text" {
+                                        rendered += fragment
+                                        continuation.yield(.textDelta(fragment))
+                                    }
+                                    if key == "thinking" {
+                                        reasoning += fragment
+                                        if thinking.isEnabled { continuation.yield(.thinkingDelta(fragment)) }
+                                        else if !fragment.isEmpty { continuation.yield(.streamActivity) }
+                                    }
+                                case "input_json_delta":
+                                    partial += delta["partial_json"] as? String ?? ""
+                                    if blocks[idx]["type"] as? String == "tool_use", let name = blocks[idx]["name"] as? String {
+                                        continuation.yield(.toolInputDelta(name: name, accumulated: partial))
+                                    }
+                                case "citations_delta":
+                                    guard let citation = delta["citation"] as? [String: Any] else { continue }
+                                    var citations = blocks[idx]["citations"] as? [[String: Any]] ?? []
+                                    citations.append(citation)
+                                    blocks[idx]["citations"] = citations
+                                    let document = citation["document_index"] as? Int ?? -1
+                                    if let raw = citation["url"] as? String ?? (documents.indices.contains(document) ? documents[document] : nil),
+                                       let scheme = URL(string: raw)?.scheme?.lowercased(), ["http", "https"].contains(scheme),
+                                       !raw.contains(where: { $0.isWhitespace || $0 == "<" || $0 == ">" }), links.insert(raw).inserted {
+                                        rendered += " <\(raw)>"
+                                        continuation.yield(.textDelta(" <\(raw)>"))
+                                    }
+                                default: break
+                                }
+                            case "content_block_stop" where blocks.indices.contains(idx):
+                                if !partial.isEmpty {
+                                    blocks[idx]["input"] = try JSONSerialization.jsonObject(with: Data(partial.utf8))
+                                }
+                                if blocks[idx]["type"] as? String == "tool_use", let id = blocks[idx]["id"] as? String,
+                                   let name = blocks[idx]["name"] as? String {
+                                    continuation.yield(.toolCallComplete(id: id, name: name, args: blocks[idx]["input"] as? [String: Any] ?? [:], metadata: nil))
+                                }
+                            case "message_stop": break readEvents
+                            case "message_delta": stop = delta["stop_reason"] as? String
+                            case "error":
+                                let error = event["error"] as? [String: Any] ?? [:]
+                                let message = error["message"] as? String ?? "Anthropic stream failed"
+                                switch error["type"] as? String {
+                                case "rate_limit_error": throw LLMError.rateLimited
+                                case "overloaded_error", "api_error": throw LLMError.transientError(message: message)
+                                default: throw LLMError.providerError(message: message)
+                                }
+                            default: break
+                            }
+                        }
+                        guard let stop else { throw LLMError.transientError(message: "Anthropic stream ended before its stop reason") }
+                        allBlocks += blocks
+                        if stop == "pause_turn" {
+                            guard round < 8 && !blocks.isEmpty else { throw LLMError.providerError(message: "Anthropic web tool continuation limit reached") }
+                            previousUsage.merge(roundUsage, uniquingKeysWith: +)
+                            history.append(["role": "assistant", "content": blocks])
+                            continue
+                        }
+                        if usedWeb {
+                            let raw = try JSONSerialization.data(withJSONObject: ["blocks": allBlocks, "text": rendered])
+                            var echo = ReasoningEcho(providerKind: "anthropic-messages", modelId: modelID,
+                                                     upstreamIdentity: base, items: [])
+                            echo.nativeWebReplay = String(decoding: raw, as: UTF8.self)
+                            continuation.yield(.reasoningEcho(echo))
+                        }
+                        if !reasoning.isEmpty { continuation.yield(.reasoningContent(reasoning)) }
+                        let reason: AgentStopReason = switch stop {
+                        case "tool_use": .toolUse
+                        case "max_tokens": .maxTokens
+                        case "refusal": .refusal
+                        default: .endTurn
+                        }
+                        continuation.yield(.done(stopReason: reason))
+                        break
+                    }
+                    continuation.finish()
+                } catch { continuation.finish(throwing: (error as? LLMError) ?? self.provider.mapError(error)) }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}

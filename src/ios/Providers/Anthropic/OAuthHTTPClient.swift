@@ -69,6 +69,7 @@ enum ClaudeCLIMimicry {
 /// auth headers before it hits the network.
 final class OAuthHTTPClient: HTTPClient {
 
+    let session: URLSession
     private let underlying: URLSessionHTTPClientAdapter
     private let registryId: String
 
@@ -85,7 +86,7 @@ final class OAuthHTTPClient: HTTPClient {
         config.protocolClasses = [OAuthURLProtocol.self]
         config.httpAdditionalHeaders = (config.httpAdditionalHeaders ?? [:]).merging(
             ["X-Minis-OAuth-UUID": rid]) { _, new in new }
-        let session = URLSession(configuration: config)
+        self.session = URLSession(configuration: config)
         self.underlying = URLSessionHTTPClientAdapter(urlSession: session)
     }
 
@@ -1718,6 +1719,7 @@ private final class EagerStreamingURLProtocol: URLProtocol, URLSessionDataDelega
 /// HTTPClient wrapper that injects `eager_input_streaming` into tool definitions
 /// for the API key authentication path.
 final class EagerStreamingHTTPClient: HTTPClient {
+    let session: URLSession
     private let underlying: URLSessionHTTPClientAdapter
 
     /// - Parameter customUserAgent: when non-nil, overrides the default URLSession
@@ -1731,7 +1733,7 @@ final class EagerStreamingHTTPClient: HTTPClient {
             config.httpAdditionalHeaders = (config.httpAdditionalHeaders ?? [:]).merging(
                 ["User-Agent": ua]) { _, new in new }
         }
-        let session = URLSession(configuration: config)
+        self.session = URLSession(configuration: config)
         self.underlying = URLSessionHTTPClientAdapter(urlSession: session)
     }
 
@@ -1747,6 +1749,7 @@ final class EagerStreamingHTTPClient: HTTPClient {
 /// HTTPClient that sends both `x-api-key` and `Authorization: Bearer` headers simultaneously.
 /// Used for manual OAuth tokens on Anthropic-compatible proxies that may expect either header.
 final class DualAuthHTTPClient: HTTPClient {
+    let session: URLSession
     private let underlying: URLSessionHTTPClientAdapter
 
     /// - Parameter customUserAgent: see `EagerStreamingHTTPClient.init`.
@@ -1758,7 +1761,7 @@ final class DualAuthHTTPClient: HTTPClient {
             config.httpAdditionalHeaders = (config.httpAdditionalHeaders ?? [:]).merging(
                 ["User-Agent": ua]) { _, new in new }
         }
-        let session = URLSession(configuration: config)
+        self.session = URLSession(configuration: config)
         self.underlying = URLSessionHTTPClientAdapter(urlSession: session)
     }
 
@@ -1895,6 +1898,10 @@ extension RequestBodyPatcher {
     /// Callable on its own so the final request body can be produced without
     /// sending it (`AnthropicAgentProvider.requestBody`).
     static func applyOAuthBodyPatches(to mutable: NSMutableURLRequest) {
+        if mutable.value(forHTTPHeaderField: "X-Minis-Prepared-Messages") == "1" {
+            mutable.setValue(nil, forHTTPHeaderField: "X-Minis-Prepared-Messages")
+            return
+        }
         // Normalize key ordering first so all patchers produce deterministic output
         // (critical for Anthropic prompt cache prefix matching)
         // [T-anthropic-toolimages-cross-request] Claim this request's token
@@ -1923,6 +1930,10 @@ extension RequestBodyPatcher {
     /// for these requests: a screenshot / read_image result reached the model
     /// as text only, and its staged entry was never taken.
     static func applyKeyAuthBodyPatches(to mutable: NSMutableURLRequest) {
+        if mutable.value(forHTTPHeaderField: "X-Minis-Prepared-Messages") == "1" {
+            mutable.setValue(nil, forHTTPHeaderField: "X-Minis-Prepared-Messages")
+            return
+        }
         RequestBodyPatcher.stampRequestToken(onto: mutable)
         RequestBodyPatcher.normalizeKeyOrder(in: mutable)
         RequestBodyPatcher.injectToolsCacheControl(into: mutable)

@@ -94,8 +94,9 @@ class GeminiProvider(
         imageParts: List<LLMMessage.ImagePart>,
         tools: List<AgentToolDefinition>,
         thinkingLevel: ThinkingLevel,
+        nativeWebEnabled: Boolean,
     ): Flow<LLMStreamChunk> = rawStreamMessage(
-        messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel,
+        messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel, nativeWebEnabled,
     ).failOnSilentEmptyCompletion(name)
 
     /**
@@ -171,11 +172,12 @@ class GeminiProvider(
         imageParts: List<LLMMessage.ImagePart>,
         tools: List<AgentToolDefinition>,
         thinkingLevel: ThinkingLevel,
+        nativeWebEnabled: Boolean,
     ): Flow<LLMStreamChunk> = callbackFlow {
         // [OpenMinis#470] A thinking-parameter 400 arrives before any byte of the
         // stream, so the retry inside never follows output already sent.
         val response = executeWithThinkingRetry("streamGenerateContent?alt=sse") { format ->
-            buildRequestBody(messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel, format)
+            buildRequestBody(messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel, format, nativeWeb = nativeWebEnabled)
         }
         if (!response.isSuccessful) {
             val errorBody = response.body?.string() ?: ""
@@ -186,6 +188,10 @@ class GeminiProvider(
         val reader = BufferedReader(InputStreamReader(response.body!!.byteStream()))
         try {
             var started = false
+            val sources = linkedSetOf<String>()
+            val grounding = GeminiGrounding()
+            val visibleText = StringBuilder()
+            val replayParts = JSONArray()
             var lastFinishReason: String? = null
             var line: String?
             while (reader.readLine().also { line = it } != null) {
@@ -206,10 +212,35 @@ class GeminiProvider(
                     send(LLMStreamChunk.ThinkingDelta(thinking))
                 }
                 if (text.isNotEmpty()) {
+                    if (nativeWebEnabled) visibleText.append(text)
                     send(LLMStreamChunk.Text(text))
                 }
 
-                // Extract function calls from streaming response
+                if (nativeWebEnabled) {
+                    val candidate = json.optJSONArray("candidates")?.optJSONObject(0)
+                    val chunks = candidate?.optJSONObject("groundingMetadata")?.optJSONArray("groundingChunks")
+                    for (i in 0 until (chunks?.length() ?: 0)) {
+                        val url = chunks?.optJSONObject(i)?.optJSONObject("web")?.optString("uri")
+                        grounding.chunkURLs.add(url)
+                        url?.let { addWebSource(sources, it) }
+                    }
+                    val supports = candidate?.optJSONObject("groundingMetadata")?.optJSONArray("groundingSupports")
+                    for (i in 0 until (supports?.length() ?: 0)) {
+                        val support = supports?.optJSONObject(i) ?: continue
+                        val text = support.optJSONObject("segment")?.optString("text") ?: continue
+                        val indices = support.optJSONArray("groundingChunkIndices") ?: continue
+                        grounding.supports.add(text to (0 until indices.length()).map { indices.optInt(it, -1) })
+                    }
+                    val urls = candidate?.optJSONObject("urlContextMetadata")?.optJSONArray("urlMetadata")
+                    for (i in 0 until (urls?.length() ?: 0)) {
+                        val entry = urls?.optJSONObject(i) ?: continue
+                        if (entry.optString("urlRetrievalStatus") == "URL_RETRIEVAL_STATUS_SUCCESS") {
+                            addWebSource(sources, entry.optString("retrievedUrl"))
+                        }
+                    }
+                    val parts = candidate?.optJSONObject("content")?.optJSONArray("parts")
+                    for (i in 0 until (parts?.length() ?: 0)) replayParts.put(parts?.getJSONObject(i))
+                }
                 val functionCalls = extractFunctionCalls(json)
                 for ((fcName, fcArgs, fcSig) in functionCalls) {
                     val toolId = "gemini_${System.nanoTime()}"
@@ -228,7 +259,15 @@ class GeminiProvider(
                     lastFinishReason = reason
                 }
             }
-            send(LLMStreamChunk.Finished(lastFinishReason ?: "end_turn"))
+            val sourceText = grounding.sourceText(visibleText.toString(), sources)
+            if (sourceText.isNotEmpty()) send(LLMStreamChunk.Text(sourceText))
+            val hasToolHistory = (0 until replayParts.length()).any {
+                val part = replayParts.getJSONObject(it)
+                part.has("toolCall") || part.has("toolResponse") || part.has("functionCall")
+            }
+            val replay = if (hasToolHistory) JSONObject().put("provider", "gemini").put("model", model.id)
+                .put("upstream", basePath).put("sourceText", sourceText).put("parts", replayParts).toString() else null
+            send(LLMStreamChunk.Finished(lastFinishReason ?: "end_turn", nativeWebReplay = replay))
         } catch (e: Exception) {
             cancel("Stream error", mapError(e))
         } finally {
@@ -251,6 +290,7 @@ class GeminiProvider(
         thinkingLevel: ThinkingLevel = ThinkingLevel.OFF,
         // [OpenMinis#470] Set only by executeWithThinkingRetry.
         thinkingFormat: ThinkingRuleResolver.GeminiThinkingFormat? = null,
+        nativeWeb: Boolean = false,
     ): JSONObject {
         val body = JSONObject()
 
@@ -285,7 +325,8 @@ class GeminiProvider(
         // can be replayed or downgraded. All-or-nothing per message keeps a
         // fully-signed turn on the fast path and sends a mixed one entirely as
         // text, which is always accepted.
-        val unsignedToolCallIds: Set<String> = if (!requiresSig) emptySet() else buildSet {
+        val unsignedToolCallIds = mutableSetOf<String>()
+        if (requiresSig) {
             for (msg in messages) {
                 val toolUses = msg.contentParts.filterIsInstance<AgentContentPart.ToolUse>()
                 if (toolUses.isEmpty()) continue
@@ -293,11 +334,12 @@ class GeminiProvider(
                 // the signed remainder alone is precisely what Gemini calls
                 // corrupted.
                 if (toolUses.any { it.thoughtSignature.isNullOrEmpty() }) {
-                    toolUses.forEach { add(it.id) }
+                    toolUses.forEach { unsignedToolCallIds.add(it.id) }
                 }
             }
         }
 
+        val callIds = mutableMapOf<String, String>()
         val contents = JSONArray()
         val lastUserIndex = messages.indexOfLast { it.role == LLMMessage.Role.USER }
         for ((index, msg) in messages.withIndex()) {
@@ -305,6 +347,27 @@ class GeminiProvider(
             val content = JSONObject()
             content.put("role", role)
 
+            if (role == "model" && msg.nativeWebReplay != null) {
+                val envelope = runCatching { JSONObject(msg.nativeWebReplay) }.getOrNull()
+                val calls = msg.contentParts.filterIsInstance<AgentContentPart.ToolUse>()
+                val raw = envelope?.optJSONArray("parts")
+                val functions = (0 until (raw?.length() ?: 0)).mapNotNull { raw?.optJSONObject(it)?.optJSONObject("functionCall") }
+                val visible = if (msg.contentParts.isEmpty()) msg.content else
+                    msg.contentParts.filterIsInstance<AgentContentPart.Text>().joinToString("") { it.text }
+                val compatibleParts = msg.contentParts.all { it is AgentContentPart.Text || it is AgentContentPart.ToolUse }
+                if (nativeWeb && compatibleParts && calls.none { it.isOffloadedArgument } && envelope?.optString("provider") == "gemini" && envelope.optString("model") == model.id &&
+                    envelope.optString("upstream") == basePath && raw != null && raw.length() > 0 &&
+                    GeminiWebReplay.matches(raw.toString(), envelope.optString("sourceText"), visible,
+                        calls.map { it.name to it.input.toString() })) {
+                    contents.put(content.put("parts", raw))
+                    calls.zip(functions).forEach { (call, function) ->
+                        unsignedToolCallIds.remove(call.id)
+                        function.optString("id").takeIf { it.isNotEmpty() }?.let { callIds[call.id] = it }
+                    }
+                    continue
+                }
+                calls.forEach { unsignedToolCallIds.add(it.id) }
+            }
             val parts = JSONArray()
 
             if (msg.contentParts.isNotEmpty()) {
@@ -365,6 +428,7 @@ class GeminiProvider(
                             } else {
                                 val responseObj = JSONObject()
                                 responseObj.put("name", part.name)
+                                callIds[part.id]?.let { responseObj.put("id", it) }
                                 val responseContent = JSONObject()
                                 val safeContent = part.content.ifEmpty { " " }
                                 responseContent.put("result", safeContent)
@@ -440,17 +504,25 @@ class GeminiProvider(
         // paths. Omitting it leaves the calling mode to the endpoint's default,
         // and a relay that defaults differently can decline to call tools at all
         // while still answering 200.
-        if (tools.isNotEmpty()) {
-            val funcDecls = JSONArray()
-            for (tool in tools) {
-                funcDecls.put(tool.toGeminiJson())
+        val declarations = JSONArray()
+        if (nativeWeb) {
+            if (!supportsNativeWeb(model.id)) {
+                throw LLMError.ProviderError("Combining native web and agent tools requires a Gemini 3 model.")
             }
-            body.put("tools", JSONArray().put(JSONObject().put("functionDeclarations", funcDecls)))
-            body.put(
-                "toolConfig",
-                JSONObject().put("functionCallingConfig", JSONObject().put("mode", "AUTO")),
-            )
+            declarations.put(JSONObject().put("googleSearch", JSONObject()))
+            declarations.put(JSONObject().put("urlContext", JSONObject()))
         }
+        if (tools.isNotEmpty()) {
+            val functions = JSONArray()
+            tools.forEach { functions.put(it.toGeminiJson()) }
+            declarations.put(JSONObject().put("functionDeclarations", functions))
+        }
+        if (nativeWeb) {
+            body.put("toolConfig", JSONObject().put("includeServerSideToolInvocations", true))
+        } else if (tools.isNotEmpty()) {
+            body.put("toolConfig", JSONObject().put("functionCallingConfig", JSONObject().put("mode", "AUTO")))
+        }
+        if (declarations.length() > 0) body.put("tools", declarations)
 
         val config = JSONObject()
         config.put("maxOutputTokens", maxTokens)
@@ -576,6 +648,11 @@ class GeminiProvider(
      * Gemini v1beta wire format. Null when absent (non-3.x models, or a chunk
      * without a signature).
      */
+    private fun addWebSource(sources: MutableSet<String>, link: String) {
+        val uri = runCatching { java.net.URI(link) }.getOrNull() ?: return
+        if (uri.scheme?.lowercase() in setOf("https", "http") && !uri.host.isNullOrBlank()) sources.add(link)
+    }
+
     private fun extractFunctionCalls(json: JSONObject): List<Triple<String, JSONObject, String?>> {
         val candidates = json.optJSONArray("candidates") ?: return emptyList()
         val first = candidates.optJSONObject(0) ?: return emptyList()
@@ -635,6 +712,12 @@ class GeminiProvider(
     }
 
     companion object {
+        fun supportsNativeWeb(modelID: String): Boolean {
+            val id = modelID.substringAfterLast('/').lowercase()
+            return Regex("^gemini-3([.-]|$)").containsMatchIn(id) &&
+                listOf("image", "tts", "audio", "robotics", "computer-use", "live").none { it in id }
+        }
+
         /**
          * [T-gemini-unsigned-narration] How much of a downgraded tool result
          * to inline. Large outputs are offloaded upstream already, so this

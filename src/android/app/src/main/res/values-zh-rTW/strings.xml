@@ -1103,6 +1103,7 @@
     <string name="model_entry_display_name">顯示名稱</string>
     <string name="model_entry_max_output_tokens">最大輸出 Token 數</string>
     <string name="model_entry_provider">AI 服務商</string>
+    <string name="model_entry_native_web">原生網路搜尋與網頁讀取</string>
     <string name="model_entry_visibility">可見性</string>
     <string name="model_entry_hidden_models_won_t_appear_in_the_model_">隱藏的模型不會出現在模型選擇器中。</string>
     <string name="model_entry_hidden">隱藏</string>

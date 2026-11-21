@@ -28181,6 +28181,29 @@
         }
       }
     },
+    "Native web search and page reading" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Native web search and page reading"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "原生联网搜索和网页读取"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "原生網路搜尋與網頁讀取"
+          }
+        }
+      }
+    },
     "Needs your approval · High risk" : {
       "extractionState" : "manual",
       "localizations" : {

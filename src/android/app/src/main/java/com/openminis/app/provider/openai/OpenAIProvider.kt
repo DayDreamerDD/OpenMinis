@@ -214,6 +214,17 @@ class OpenAIProvider private constructor(
     ) : this(apiKey = null, oauthTokenProvider = oauthTokenProvider, model = model, codexAccountId = codexAccountId)
 
     companion object {
+        fun nativeWebTypes(enabled: Boolean, responses: Boolean, deepSeek: Boolean, modelID: String): List<String> {
+            if (!enabled) return emptyList()
+            if (deepSeek && modelID == "deepseek-flash") {
+                return listOf("deepseek_web_search", "deepseek_read_url")
+            }
+            if (responses && (!deepSeek || modelID == "deepseek-v4-pro")) {
+                return listOf("web_search")
+            }
+            return emptyList()
+        }
+
         /** [T-android-max-tokens-default] iOS OpenAIAgentProvider.defaultMaxTokens. */
         const val CHAT_COMPLETIONS_DEFAULT_MAX_TOKENS = 16_384
         const val RESPONSES_DEFAULT_MAX_TOKENS = 32_768
@@ -903,8 +914,9 @@ class OpenAIProvider private constructor(
         imageParts: List<LLMMessage.ImagePart>,
         tools: List<AgentToolDefinition>,
         thinkingLevel: ThinkingLevel,
+        nativeWebEnabled: Boolean,
     ): Flow<LLMStreamChunk> = rawStreamMessage(
-        messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel,
+        messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel, nativeWebEnabled,
     ).failOnSilentEmptyCompletion(name)
 
     private fun rawStreamMessage(
@@ -915,6 +927,7 @@ class OpenAIProvider private constructor(
         imageParts: List<LLMMessage.ImagePart>,
         tools: List<AgentToolDefinition>,
         thinkingLevel: ThinkingLevel,
+        nativeWebEnabled: Boolean,
     ): Flow<LLMStreamChunk> = callbackFlow {
         val body = if (isCodexImageModel) {
             // [T-gpt-image2-codex-backend-route-android] gpt-image-2 on an
@@ -941,9 +954,9 @@ class OpenAIProvider private constructor(
             )
             buildCodexImageBody(messages)
         } else if (usesChatCompletionsAPI) {
-            buildRequestBody(messages, systemPrompt, maxTokens, stream = true, temperature = temperature, imageParts = imageParts, tools = tools, thinkingLevel = thinkingLevel)
+            buildRequestBody(messages, systemPrompt, maxTokens, stream = true, temperature = temperature, imageParts = imageParts, tools = tools, thinkingLevel = thinkingLevel, nativeWebEnabled = nativeWebEnabled)
         } else {
-            buildResponsesAPIBody(messages, systemPrompt, maxTokens, stream = true, imageParts = imageParts, tools = tools, thinkingLevel = thinkingLevel)
+            buildResponsesAPIBody(messages, systemPrompt, maxTokens, stream = true, imageParts = imageParts, tools = tools, thinkingLevel = thinkingLevel, nativeWebEnabled = nativeWebEnabled)
         }
         // [T-speed-tier] What this request asked for, to compare with the tier
         // response.completed echoes back.
@@ -1196,6 +1209,21 @@ class OpenAIProvider private constructor(
         // emit a combined "callId|fcId" identifier that splitResponsesAPIIds() unpacks.
         data class ResponsesToolCallAccumulator(var callId: String = "", var name: String = "", val args: StringBuilder = StringBuilder(), var started: Boolean = false)
         val responsesToolCalls = mutableMapOf<String, ResponsesToolCallAccumulator>()
+        var nativeReplay: String? = null
+        val citationUrls = linkedSetOf<String>()
+        var lastWebStepReasoningStart = 0
+        fun addCitation(annotation: JSONObject?) {
+            if (!nativeWebEnabled || annotation?.optString("type") != "url_citation") return
+            val href = (annotation.optJSONObject("url_citation") ?: annotation).optString("url")
+            val url = href.toHttpUrlOrNull() ?: return
+            if (url.username.isEmpty() && url.password.isEmpty() && href.none { it.isWhitespace() || it == '<' || it == '>' }) citationUrls.add(url.toString())
+        }
+        suspend fun finishNativeWeb() {
+            if (citationUrls.isNotEmpty()) {
+                send(LLMStreamChunk.Text(citationUrls.joinToString(" ", prefix = "\n\n") { "<$it>" }))
+                citationUrls.clear()
+            }
+        }
         // One-shot info log the first time the Responses API streams a reasoning
         // delta — useful for confirming the Thinking pipeline is wired up when
         // diagnosing "I set thinking high but see nothing" reports.
@@ -1273,9 +1301,10 @@ class OpenAIProvider private constructor(
                     // stream think-tag reasoning live and then drop it — the
                     // thinking bubble would vanish on session reload.
                     if (sawReasoningField || reasoningAccum.isNotEmpty()) {
-                        send(LLMStreamChunk.ReasoningContent(reasoningAccum.toString()))
+                        send(LLMStreamChunk.ReasoningContent(reasoningAccum.substring(lastWebStepReasoningStart)))
                     }
-                    send(LLMStreamChunk.Finished(finishReason))
+                    finishNativeWeb()
+                    send(LLMStreamChunk.Finished(finishReason, nativeWebReplay = nativeReplay))
                     sentFinished = true
                     break
                 }
@@ -1377,6 +1406,7 @@ class OpenAIProvider private constructor(
                                 send(LLMStreamChunk.ThinkingDelta(delta))
                             }
                         }
+                        type == "response.output_text.annotation.added" -> addCitation(event.optJSONObject("annotation"))
                         type == "response.output_text.delta" -> {
                             val delta = event.optString("delta", "")
                             if (delta.isNotEmpty()) send(LLMStreamChunk.Text(delta))
@@ -1564,6 +1594,33 @@ class OpenAIProvider private constructor(
                         }
                         type == "response.completed" -> {
                             val resp = event.optJSONObject("response")
+                            val output = resp?.optJSONArray("output")
+                            if (nativeWebEnabled && output != null) {
+                                for (i in 0 until output.length()) {
+                                    val content = output.optJSONObject(i)?.optJSONArray("content") ?: continue
+                                    for (j in 0 until content.length()) {
+                                        val annotations = content.optJSONObject(j)?.optJSONArray("annotations") ?: continue
+                                        for (k in 0 until annotations.length()) addCitation(annotations.optJSONObject(k))
+                                    }
+                                }
+                            }
+                            if (nativeWebEnabled && isDeepSeekWebEndpoint && output != null) {
+                                // Only provider-owned steps are replayed. Visible text and local calls
+                                // always come from current history after edits or context compaction.
+                                val steps = JSONArray()
+                                var hasWebCall = false
+                                for (i in 0 until output.length()) {
+                                    val item = output.optJSONObject(i) ?: continue
+                                    when (item.optString("type")) {
+                                        "reasoning" -> steps.put(item)
+                                        "web_search_call" -> {
+                                            steps.put(item)
+                                            hasWebCall = true
+                                        }
+                                    }
+                                }
+                                if (hasWebCall) nativeReplay = webReplay(steps, true, nativeWebEnabled)
+                            }
                             val status = resp?.optString("status", "")
                             // When the model emitted tool calls the API returns status=completed
                             // with no stop_reason; surface "tool_use" so the agent loop knows to
@@ -1630,6 +1687,10 @@ class OpenAIProvider private constructor(
                     if (choices != null && choices.length() > 0) {
                         val choice = choices.getJSONObject(0)
                         val delta = choice.optJSONObject("delta")
+                        delta?.optJSONArray("annotations")?.let { annotations ->
+                            for (i in 0 until annotations.length()) addCitation(annotations.optJSONObject(i))
+                        }
+                        delta?.optJSONArray("server_tool_calls")?.let { nativeReplay = webReplay(it, false, nativeWebEnabled) }
 
                         // Reasoning / thinking content (DeepSeek, Kimi, etc.)
                         delta?.let { d ->
@@ -1744,6 +1805,11 @@ class OpenAIProvider private constructor(
                             }
                         }
 
+                        if (nativeWebEnabled && isDeepSeekWebEndpoint &&
+                            choice.optJSONObject("server_tool_event")?.optString("type") == "step_reasoning_done") {
+                            lastWebStepReasoningStart = reasoningAccum.length
+                        }
+
                         // Finish reason
                         choice.safeOptString("finish_reason", "").let {
                             if (it.isNotEmpty()) {
@@ -1851,9 +1917,10 @@ class OpenAIProvider private constructor(
                     if (fin.visible.isNotEmpty()) send(LLMStreamChunk.Text(fin.visible))
                 }
                 if (sawReasoningField || reasoningAccum.isNotEmpty()) {
-                    send(LLMStreamChunk.ReasoningContent(reasoningAccum.toString()))
+                    send(LLMStreamChunk.ReasoningContent(reasoningAccum.substring(lastWebStepReasoningStart)))
                 }
-                send(LLMStreamChunk.Finished(finishReason))
+                finishNativeWeb()
+                send(LLMStreamChunk.Finished(finishReason, nativeWebReplay = nativeReplay))
                 sentFinished = true
                 com.openminis.app.logging.AppLogger.info(
                     "OpenAIProvider",
@@ -2328,6 +2395,23 @@ class OpenAIProvider private constructor(
     // (T-android-toolresult-image-dropped) is a property of the request BODY,
     // and going through MockWebServer to read it only adds a network dependency
     // to a question that is pure JSON construction.
+    private val isDeepSeekWebEndpoint: Boolean
+        get() = basePath.toHttpUrlOrNull()?.host == "api.deepseek.com"
+
+    // Bind opaque page signatures to the endpoint, model and wire protocol that minted them.
+    private fun webReplay(items: JSONArray?, responses: Boolean, enabled: Boolean): String? {
+        if (!isDeepSeekWebEndpoint || !enabled || items == null || items.length() == 0) return null
+        return JSONObject().put("base", basePath).put("model", model.id)
+            .put("responses", responses).put("items", items).toString()
+    }
+
+    private fun readWebReplay(message: LLMMessage, responses: Boolean, enabled: Boolean): JSONArray? {
+        if (!isDeepSeekWebEndpoint || !enabled || message.role != LLMMessage.Role.ASSISTANT) return null
+        val replay = message.nativeWebReplay?.let { runCatching { JSONObject(it) }.getOrNull() } ?: return null
+        return replay.takeIf { it.optString("base") == basePath && it.optString("model") == model.id &&
+            it.opt("responses") == responses }?.optJSONArray("items")
+    }
+
     internal fun buildRequestBody(
         messages: List<LLMMessage>,
         systemPrompt: String?,
@@ -2337,6 +2421,7 @@ class OpenAIProvider private constructor(
         imageParts: List<LLMMessage.ImagePart>,
         tools: List<AgentToolDefinition> = emptyList(),
         thinkingLevel: ThinkingLevel = ThinkingLevel.OFF,
+        nativeWebEnabled: Boolean = false,
     ): JSONObject {
         // T264: cross-provider image sanitization, mirrors iOS
         // OpenAIAgentProvider.swift:744-768 / 900-918. When the target model
@@ -2408,11 +2493,13 @@ class OpenAIProvider private constructor(
         }
 
         // Tools
-        if (tools.isNotEmpty()) {
+        val hostedTools = nativeWebTypes(nativeWebEnabled, false, isDeepSeekWebEndpoint, model.id)
+        if (tools.isNotEmpty() || hostedTools.isNotEmpty()) {
             val toolsArray = JSONArray()
             for (tool in tools) {
                 toolsArray.put(tool.toOpenAIJson())
             }
+            hostedTools.forEach { toolsArray.put(JSONObject().put("type", it)) }
             body.put("tools", toolsArray)
             body.put("tool_choice", "auto")
         }
@@ -2484,6 +2571,7 @@ class OpenAIProvider private constructor(
                     msg.role == LLMMessage.Role.ASSISTANT -> {
                         val obj = JSONObject()
                         obj.put("role", "assistant")
+                        readWebReplay(msg, false, nativeWebEnabled)?.let { obj.put("server_tool_calls", it) }
                         if (echoReasoning) {
                             val rc = msg.reasoningContent
                             if (rc != null) {
@@ -2705,6 +2793,7 @@ class OpenAIProvider private constructor(
                 // Legacy: plain text messages
                 val obj = JSONObject()
                 obj.put("role", msg.role.value)
+                readWebReplay(msg, false, nativeWebEnabled)?.let { obj.put("server_tool_calls", it) }
 
                 if (echoReasoning && msg.role == LLMMessage.Role.ASSISTANT) {
                     val rc = msg.reasoningContent
@@ -3516,6 +3605,7 @@ class OpenAIProvider private constructor(
         imageParts: List<LLMMessage.ImagePart> = emptyList(),
         tools: List<AgentToolDefinition> = emptyList(),
         thinkingLevel: ThinkingLevel = ThinkingLevel.OFF,
+        nativeWebEnabled: Boolean = false,
     ): JSONObject {
         // T264: same vision-capability gate as buildRequestBody. Responses API
         // path (Codex OAuth) is currently always wired to a vision-capable
@@ -3691,11 +3781,16 @@ class OpenAIProvider private constructor(
         // parameters}), distinct from Chat Completions' wrapped {type, function:{...}}.
         // Until this branch existed, Responses-API requests went out with no `tools`
         // field at all, so the model invented its own <tool_call>{...} text format.
-        if (tools.isNotEmpty()) {
+        if (nativeWebEnabled && isDeepSeekWebEndpoint && !thinkingLevel.isEnabled) {
+            body.put("reasoning", JSONObject().put("effort", "none"))
+        }
+        val hostedTools = nativeWebTypes(nativeWebEnabled, true, isDeepSeekWebEndpoint, model.id)
+        if (tools.isNotEmpty() || hostedTools.isNotEmpty()) {
             val toolsArray = JSONArray()
             for (tool in tools) {
                 toolsArray.put(tool.toResponsesAPIJson())
             }
+            hostedTools.forEach { toolsArray.put(JSONObject().put("type", it)) }
             body.put("tools", toolsArray)
             body.put("tool_choice", "auto")
         }
@@ -3708,6 +3803,10 @@ class OpenAIProvider private constructor(
         // buildRequestBody: top-level images ride on the LAST user message.
         val lastUserIdx = messages.indexOfLast { it.role == LLMMessage.Role.USER }
         for ((msgIndex, msg) in messages.withIndex()) {
+            val replay = readWebReplay(msg, true, nativeWebEnabled)
+            if (replay != null) {
+                for (i in 0 until replay.length()) input.put(replay.get(i))
+            }
             val attachTopLevelImages =
                 msgIndex == lastUserIdx && msg.role == LLMMessage.Role.USER && imageParts.isNotEmpty()
             if (msg.contentParts.isNotEmpty()) {

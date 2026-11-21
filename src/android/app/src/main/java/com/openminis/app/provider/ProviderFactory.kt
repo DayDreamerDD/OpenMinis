@@ -10,6 +10,20 @@ import com.openminis.app.provider.anthropic.AnthropicProvider
 import com.openminis.app.provider.gemini.GeminiProvider
 import com.openminis.app.provider.openai.OpenAIProvider
 
+fun ProviderInstance.supportsNativeWeb(modelId: String): Boolean {
+    if (credentialType != ProviderCredential.apiKey) return false
+    val deepSeek = runCatching { java.net.URI(effectiveBaseURL.orEmpty()).host }
+        .getOrNull().equals("api.deepseek.com", ignoreCase = true)
+    return when (providerType) {
+        ProviderType.gemini -> GeminiProvider.supportsNativeWeb(modelId)
+        ProviderType.anthropic -> !deepSeek || modelId == "deepseek-flash"
+        ProviderType.openAI, ProviderType.openAIResponses -> OpenAIProvider.nativeWebTypes(
+            true, useResponsesAPI || providerType == ProviderType.openAIResponses, deepSeek, modelId,
+        ).isNotEmpty()
+        else -> false
+    }
+}
+
 object ProviderFactory {
     /**
      * Create a provider, optionally with OAuth support.

@@ -202,6 +202,8 @@ struct ReasoningEcho: @unchecked Sendable {
     /// re-inserted into the next request's input array in the same order
     /// (Responses API rejects out-of-order reasoning items).
     let items: [Item]
+    /// Original server-tool output required for a follow-up on the same model and endpoint.
+    var nativeWebReplay: String? = nil
 
     enum Item: @unchecked Sendable {
         /// OpenAI Responses API reasoning item.
@@ -230,6 +232,7 @@ extension ReasoningEcho {
         let modelId: String
         let upstreamIdentity: String?
         let items: [Item]
+        let nativeWebReplay: String?
     }
 
     /// JSON for persistence, or nil when there is nothing worth storing.
@@ -243,9 +246,10 @@ extension ReasoningEcho {
                     return Wire.Item(id: id, summary: summary)
                 }
                 return nil
-            }
+            },
+            nativeWebReplay: nativeWebReplay
         )
-        guard !wire.items.isEmpty,
+        guard !wire.items.isEmpty || wire.nativeWebReplay != nil,
               let data = try? JSONEncoder().encode(wire) else { return nil }
         return String(data: data, encoding: .utf8)
     }
@@ -255,12 +259,13 @@ extension ReasoningEcho {
     init?(persistedJSON json: String?) {
         guard let json, let data = json.data(using: .utf8),
               let wire = try? JSONDecoder().decode(Wire.self, from: data),
-              !wire.items.isEmpty else { return nil }
+              !wire.items.isEmpty || wire.nativeWebReplay != nil else { return nil }
         self.init(
             providerKind: wire.providerKind,
             modelId: wire.modelId,
             upstreamIdentity: wire.upstreamIdentity,
-            items: wire.items.map { .openaiReasoning(id: $0.id, encryptedContent: nil, summary: $0.summary) }
+            items: wire.items.map { .openaiReasoning(id: $0.id, encryptedContent: nil, summary: $0.summary) },
+            nativeWebReplay: wire.nativeWebReplay
         )
     }
 }

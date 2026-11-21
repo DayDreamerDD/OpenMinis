@@ -198,6 +198,22 @@ struct ProviderInstance: Identifiable, Codable, Hashable {
         (providerType == .openAI || providerType == .openAIResponses) && credentialType == .apiKey
     }
 
+    func supportsNativeWeb(modelID: String) -> Bool {
+        guard credentialType == .apiKey else { return false }
+        let deepSeek = effectiveCustomBaseURL.flatMap { URL(string: $0)?.host?.lowercased() } == "api.deepseek.com"
+        switch providerType {
+        case .gemini:
+            return GeminiProvider.supportsNativeWeb(modelID)
+        case .anthropic:
+            return !deepSeek || modelID == "deepseek-flash"
+        case .openAI, .openAIResponses:
+            return !OpenAIAgentProvider.nativeWebTypes(enabled: true, responses: providerType == .openAIResponses,
+                                                        deepSeek: deepSeek, modelID: modelID).isEmpty
+        default:
+            return false
+        }
+    }
+
     /// Returns customBaseURL if non-nil and non-empty, otherwise nil.
     /// Use this to check whether a custom base is configured; for building request URLs use resolvedBaseURL(default:).
     var effectiveCustomBaseURL: String? {

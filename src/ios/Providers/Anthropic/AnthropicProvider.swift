@@ -22,6 +22,9 @@ final class AnthropicProvider: LLMProvider {
     var model: LLMModel
 
     /// The underlying SDK service — exposed for direct tool-use calls.
+    let nativeWebSession: URLSession
+    let nativeWebKey: String
+    let nativeWebBase: String
     let service: AnthropicService
 
     /// Whether this provider uses Claude Code OAuth credentials.
@@ -196,7 +199,7 @@ final class AnthropicProvider: LLMProvider {
         return host == "api.anthropic.com" || host.hasSuffix(".anthropic.com")
     }
 
-    init(apiKey: String, model: LLMModel = .claudeHaiku45, basePath: String? = nil, appendV1Suffix: Bool = true, customUserAgent: String? = nil) {
+    init(apiKey: String, model: LLMModel = .claudeHaiku45, basePath: String? = nil, appendV1Suffix: Bool = true, customUserAgent: String? = nil, nativeWebSession: URLSession? = nil) {
         self.model = model
         self.isClaudeCode = false
         self.betaHeaders = nil
@@ -204,11 +207,15 @@ final class AnthropicProvider: LLMProvider {
             ? stripV1Suffix(basePath ?? "https://api.anthropic.com")
             : (basePath ?? "https://api.anthropic.com")
         self.isOfficialAnthropicEndpoint = Self.isOfficialEndpoint(resolvedBase)
+        let client = EagerStreamingHTTPClient(customUserAgent: customUserAgent)
+        self.nativeWebSession = nativeWebSession ?? client.session
+        self.nativeWebKey = apiKey
+        self.nativeWebBase = resolvedBase
         self.service = AnthropicServiceFactory.service(
             apiKey: apiKey,
             basePath: resolvedBase,
             betaHeaders: nil,
-            httpClient: EagerStreamingHTTPClient(customUserAgent: customUserAgent)
+            httpClient: client
         )
     }
 
@@ -222,11 +229,15 @@ final class AnthropicProvider: LLMProvider {
             ? stripV1Suffix(basePath ?? "https://api.anthropic.com")
             : (basePath ?? "https://api.anthropic.com")
         self.isOfficialAnthropicEndpoint = Self.isOfficialEndpoint(resolvedBase)
+        let client = DualAuthHTTPClient(customUserAgent: customUserAgent)
+        self.nativeWebSession = client.session
+        self.nativeWebKey = manualToken
+        self.nativeWebBase = resolvedBase
         self.service = AnthropicServiceFactory.service(
             apiKey: manualToken,
             basePath: resolvedBase,
             betaHeaders: nil,
-            httpClient: DualAuthHTTPClient(customUserAgent: customUserAgent)
+            httpClient: client
         )
     }
 
@@ -245,13 +256,17 @@ final class AnthropicProvider: LLMProvider {
             ? stripV1Suffix(basePath ?? "https://api.anthropic.com")
             : (basePath ?? "https://api.anthropic.com")
         self.isOfficialAnthropicEndpoint = Self.isOfficialEndpoint(resolvedBase)
+        let client = OAuthHTTPClient(tokenProvider: oauthTokenProvider, quotaInstanceId: quotaInstanceId)
+        self.nativeWebSession = client.session
+        self.nativeWebKey = "oauth-placeholder"
+        self.nativeWebBase = resolvedBase
         self.service = AnthropicServiceFactory.service(
             apiKey: "oauth-placeholder",
             basePath: resolvedBase,
             betaHeaders: headers,
             // [T-quota-claude-subscription] Tags replies with the instance so their
             // usage headers update its quota.
-            httpClient: OAuthHTTPClient(tokenProvider: oauthTokenProvider, quotaInstanceId: quotaInstanceId)
+            httpClient: client
         )
     }
 

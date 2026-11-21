@@ -126,6 +126,8 @@ struct LLMModel: Equatable, Hashable, Identifiable, Sendable, Codable {
     /// catalog keeps winning, as before); set after init and carried across
     /// `ModelEntry.model`'s rebuild by hand, like `voiceRole`.
     var limitsReportedByEndpoint: Bool?
+    /// Set when constructing the ordinary chat provider for an opted-in model.
+    var nativeWebEnabled: Bool?
 
     init(id: String, displayName: String, provider: String, modalityOverride: ModelModality? = nil,
          contextWindow: Int? = nil, maxOutputTokens: Int? = nil,

@@ -1,8 +1,10 @@
 package com.openminis.app.provider
 
+import com.openminis.app.data.model.AgentContentPart
 import com.openminis.app.data.model.AgentToolDefinition
 import com.openminis.app.data.model.AgentToolParam
 import com.openminis.app.data.model.LLMMessage
+import com.openminis.app.data.model.LLMStreamChunk
 import com.openminis.app.data.model.LLMModel
 import com.openminis.app.provider.gemini.GeminiProvider
 import kotlinx.coroutines.flow.toList
@@ -146,4 +148,44 @@ class GeminiToolFieldNamingTest {
         assertFalse("no tools key on a toolless turn: $body", body.has("tools"))
         assertFalse("no toolConfig key on a toolless turn: $body", body.has("toolConfig"))
     }
+    @Test
+    fun `native web keeps custom tools and collects metadata-only sources`() = runBlocking {
+        val mixed = GeminiProvider("key", LLMModel.gemini25Flash.copy(id = "gemini-3.8-flash"),
+            server.url("/").toString().trimEnd('/'))
+        server.enqueue(MockResponse().setBody(
+            """data: {"candidates":[{"content":{"parts":[{"toolCall":{"id":"a","toolType":"GOOGLE_SEARCH_WEB"},"thoughtSignature":"signed"},{"text":"Answer"},{"functionCall":{"id":"wire-call","name":"file_write","args":{"path":"note"}}}]}}]}""" + "\n\n" +
+            """data: {"candidates":[{"finishReason":"STOP","groundingMetadata":{"groundingChunks":[{"web":{"uri":"https://example.com"}},{"web":{"uri":"javascript:alert(1)"}}]},"urlContextMetadata":{"urlMetadata":[{"retrievedUrl":"https://example.com","urlRetrievalStatus":"URL_RETRIEVAL_STATUS_SUCCESS"}]}}]}""" + "\n\n"
+        ))
+        val chunks = mixed.streamMessage(messages = listOf(LLMMessage(LLMMessage.Role.USER, "look up")),
+            systemPrompt = null, maxTokens = 1024, tools = tools(), nativeWebEnabled = true).toList()
+        val request = JSONObject(server.takeRequest().body.readUtf8())
+        val declarations = request.getJSONArray("tools")
+        assertTrue(declarations.getJSONObject(0).has("googleSearch"))
+        assertTrue(declarations.getJSONObject(1).has("urlContext"))
+        assertTrue(declarations.getJSONObject(2).has("functionDeclarations"))
+        val config = request.getJSONObject("toolConfig")
+        assertTrue(config.getBoolean("includeServerSideToolInvocations"))
+        assertFalse(config.has("functionCallingConfig"))
+        val text = chunks.filterIsInstance<LLMStreamChunk.Text>().joinToString("") { it.text }
+        assertEquals("Answer\n\nSources\n- <https://example.com>", text)
+        val replay = JSONObject(chunks.filterIsInstance<LLMStreamChunk.Finished>().single().nativeWebReplay!!)
+        assertEquals("signed", replay.getJSONArray("parts").getJSONObject(0).getString("thoughtSignature"))
+
+        val tool = chunks.filterIsInstance<LLMStreamChunk.ToolCallComplete>().single()
+        val history = listOf(
+            LLMMessage(LLMMessage.Role.USER, "look up"),
+            LLMMessage(LLMMessage.Role.ASSISTANT, "", nativeWebReplay = replay.toString(),
+                contentParts = listOf(AgentContentPart.Text(text), AgentContentPart.ToolUse(tool.id, "file_write", JSONObject().put("path", "note")))),
+            LLMMessage(LLMMessage.Role.USER, "", contentParts = listOf(AgentContentPart.ToolResult(tool.id, "file_write", "ok"))),
+        )
+        server.enqueue(MockResponse().setBody(
+            """data: {"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}]}""" + "\n\n"
+        ))
+        mixed.streamMessage(history, null, 1024, tools = tools(), nativeWebEnabled = true).toList()
+        val contents = JSONObject(server.takeRequest().body.readUtf8()).getJSONArray("contents")
+        assertEquals(replay.getJSONArray("parts").toString(), contents.getJSONObject(1).getJSONArray("parts").toString())
+        val result = contents.getJSONObject(2).getJSONArray("parts").getJSONObject(0).getJSONObject("functionResponse")
+        assertEquals("wire-call", result.getString("id"))
+    }
+
 }

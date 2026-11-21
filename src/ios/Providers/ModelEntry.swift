@@ -27,6 +27,7 @@ struct ModelOverrides: Codable, Hashable, Sendable {
     /// Thinking toggle revert).
     var supportsReasoning: Bool?
     var maxThinkingLevel: ThinkingLevel?
+    var nativeWebEnabled: Bool?
 
     // MARK: - [T-model-custom-params] User-set request parameters
     //
@@ -66,6 +67,7 @@ struct ModelOverrides: Codable, Hashable, Sendable {
          contextWindow: Int? = nil,
          supportsReasoning: Bool? = nil,
          maxThinkingLevel: ThinkingLevel? = nil,
+         nativeWebEnabled: Bool? = nil,
          temperature: Double? = nil,
          topP: Double? = nil,
          customHeaders: [String: String]? = nil,
@@ -76,6 +78,7 @@ struct ModelOverrides: Codable, Hashable, Sendable {
         self.contextWindow = contextWindow
         self.supportsReasoning = supportsReasoning
         self.maxThinkingLevel = maxThinkingLevel
+        self.nativeWebEnabled = nativeWebEnabled
         self.temperature = temperature
         self.topP = topP
         self.customHeaders = customHeaders
@@ -90,6 +93,7 @@ struct ModelOverrides: Codable, Hashable, Sendable {
             && contextWindow == nil
             && supportsReasoning == nil
             && maxThinkingLevel == nil
+            && nativeWebEnabled == nil
             && temperature == nil
             && topP == nil
             && customHeaders == nil
@@ -100,7 +104,7 @@ struct ModelOverrides: Codable, Hashable, Sendable {
         case displayName, maxOutputTokens, modalityOverride, contextWindow, supportsReasoning, maxThinkingLevel
         // [T-model-custom-params] Additive: an older payload simply lacks
         // these keys and decodes them as nil.
-        case temperature, topP, customHeaders, extraBodyParams
+        case nativeWebEnabled, temperature, topP, customHeaders, extraBodyParams
     }
 
     init(from decoder: Decoder) throws {
@@ -119,6 +123,7 @@ struct ModelOverrides: Codable, Hashable, Sendable {
         // blob written before these fields existed — an old backup, a config
         // synced from an older build — decodes to nil rather than throwing and
         // losing every other override alongside it.
+        self.nativeWebEnabled = try container.decodeIfPresent(Bool.self, forKey: .nativeWebEnabled)
         self.temperature = try container.decodeIfPresent(Double.self, forKey: .temperature)
         self.topP = try container.decodeIfPresent(Double.self, forKey: .topP)
         self.customHeaders = try container.decodeIfPresent([String: String].self, forKey: .customHeaders)
@@ -136,6 +141,7 @@ struct ModelOverrides: Codable, Hashable, Sendable {
         // [T-model-custom-params] `encodeIfPresent`, so an entry with none of
         // these set serialises byte-identically to before this change — no
         // diff churn in provider_config.json, and no LWW noise in sync.
+        try container.encodeIfPresent(nativeWebEnabled, forKey: .nativeWebEnabled)
         try container.encodeIfPresent(temperature, forKey: .temperature)
         try container.encodeIfPresent(topP, forKey: .topP)
         try container.encodeIfPresent(customHeaders, forKey: .customHeaders)
@@ -236,7 +242,9 @@ struct ModelEntry: Identifiable, Codable, Hashable {
             contextWindow: overrides.contextWindow ?? baseModel.contextWindow,
             maxOutputTokens: overrides.maxOutputTokens ?? baseModel.maxOutputTokens,
             supportsReasoning: overrides.supportsReasoning ?? baseModel.supportsReasoning,
-            interleavedReasoningField: baseModel.interleavedReasoningField
+            interleavedReasoningField: baseModel.interleavedReasoningField,
+            reasoningEffortValues: baseModel.reasoningEffortValues,
+            declaresNoEffortTiers: baseModel.declaresNoEffortTiers
         )
         // Not an init parameter, so the rebuild would drop it and a renamed or
         // re-moded OpenRouter entry would fall back to the audio-bit rule.

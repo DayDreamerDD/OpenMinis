@@ -94,4 +94,39 @@ final class GeminiSignatureRestoreTests: XCTestCase {
         XCTAssertTrue(isStructural(p.convertMessages(toolUseHistory(id: "call-1"))),
                       "only gemini-3.x requires thoughtSignature")
     }
+    func testNativeWebReplayRestoresSignedPartsAndMatchesFunctionResponseID() throws {
+        let provider = geminiProvider()
+        provider.provider.model.nativeWebEnabled = true
+        var history = toolUseHistory(id: "local-id")
+        var echo = ReasoningEcho(providerKind: "gemini", modelId: provider.model.id,
+                                 upstreamIdentity: provider.provider.nativeWebUpstream, items: [])
+        echo.nativeWebReplay = #"{"sourceText":"","parts":[{"toolCall":{"toolType":"GOOGLE_SEARCH_WEB","id":"search"},"thoughtSignature":"signed"},{"functionCall":{"name":"shell_execute","args":{"command":"ls"},"id":"wire-id"}}]}"#
+        history[1].reasoningEcho = echo
+        let converted = provider.convertMessages(history)
+        let assistant = try XCTUnwrap(converted[1]["parts"] as? [[String: Any]])
+        XCTAssertEqual(assistant.first?["thoughtSignature"] as? String, "signed")
+        let parts = try XCTUnwrap(converted[2]["parts"] as? [[String: Any]])
+        let result = try XCTUnwrap(parts.first?["functionResponse"] as? [String: Any])
+        XCTAssertEqual(result["id"] as? String, "wire-id")
+
+        var edited = history
+        edited[1].parts = [.text("edited"), .toolUse(id: "local-id", name: "shell_execute", input: ["command": "ls"])]
+        XCTAssertFalse(isStructural(provider.convertMessages(edited)))
+        edited[1].parts = [.toolUse(id: "local-id", name: "shell_execute", input: ["command": "pruned"])]
+        XCTAssertFalse(isStructural(provider.convertMessages(edited)))
+
+        echo.upstreamIdentity = "https://other.example"
+        history[1].reasoningEcho = echo
+        XCTAssertFalse(isStructural(provider.convertMessages(history)))
+    }
+
+    func testLateGroundingSupportsUseStreamGlobalIndices() {
+        let source = "https://example.com/weather"
+        let other = "https://example.com/page"
+        let footer = GeminiProvider.sourceText(
+            answer: "臺北 [rain] 🌧", sources: [source, other], chunks: [nil, source, other],
+            supports: [["segment": ["text": "臺北 [rain]"], "groundingChunkIndices": [0, 1, 1, 9]]])
+        XCTAssertEqual(footer, "\n\nSources\n- 臺北 \\[rain\\] [1](<\(source)>)\n- <\(other)>")
+    }
+
 }

@@ -1355,6 +1355,7 @@ final class ProviderConfigStore: ObservableObject {
                     if let temp = entry.overrides.temperature { o["temperature"] = temp }
                     if let tp = entry.overrides.topP { o["topP"] = tp }
                     if let ch = entry.overrides.customHeaders, !ch.isEmpty { o["customHeaders"] = ch }
+                    if let web = entry.overrides.nativeWebEnabled { o["nativeWebEnabled"] = web }
                     if let eb = entry.overrides.extraBodyParams, !eb.isEmpty { o["extraBodyParams"] = eb }
                     m["overrides"] = o
                 }
@@ -1608,6 +1609,7 @@ final class ProviderConfigStore: ObservableObject {
                     overrides.temperature = o["temperature"] as? Double
                     overrides.topP = o["topP"] as? Double
                     overrides.customHeaders = o["customHeaders"] as? [String: String]
+                    overrides.nativeWebEnabled = o["nativeWebEnabled"] as? Bool
                     overrides.extraBodyParams = o["extraBodyParams"] as? [String: String]
                 }
                 let entry = ModelEntry(

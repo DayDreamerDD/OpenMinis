@@ -29,6 +29,7 @@ data class LLMMessage(
      * reasoning_content once `thinking` is enabled.
      */
     val reasoningContent: String? = null,
+    val nativeWebReplay: String? = null,
 ) {
     enum class Role(val value: String) {
         USER("user"),
