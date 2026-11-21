@@ -31,6 +31,17 @@ final class OpenAINativeWebTests: XCTestCase {
         XCTAssertEqual(types(true, false, false, "relay-model"), [])
     }
 
+    func testCitationFooterKeepsInlineLinksAndAddsOnlyMissingSources() {
+        let docs = "https://developers.openai.com/api/docs/guides/tools-web-search?api-mode=responses"
+        let other = "https://developers.openai.com/guide_(tools)?a=1#intro"
+        let answer = "官方文档。([developers.openai.com](\(docs)))"
+        XCTAssertEqual(OpenAIAgentProvider.citationFooter(answer, [docs + "&utm_source=openai", docs]), "")
+        XCTAssertEqual(OpenAIAgentProvider.citationFooter(answer, [docs, other, other]),
+                       "\n\n[developers.openai.com](https://developers.openai.com/guide_%28tools%29?a=1#intro)")
+        XCTAssertEqual(OpenAIAgentProvider.citationFooter("developers.openai.com", [docs]),
+                       "\n\n[developers.openai.com](\(docs))")
+    }
+
     func testWireCitationShapes() {
         let href = "https://example.com/report"
         XCTAssertEqual(OpenAIAgentProvider.citationURL(["type": "url_citation", "url": href]), href)

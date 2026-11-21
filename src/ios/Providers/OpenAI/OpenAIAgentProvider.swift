@@ -163,6 +163,37 @@ final class OpenAIAgentProvider: AgentProvider {
         return url.absoluteString
     }
 
+    private static let inlineCitationDestination = try! NSRegularExpression(
+        pattern: #"\]\((https?://[^\s)]+)\)"#, options: .caseInsensitive
+    )
+
+    static func citationFooter(_ text: String, _ urls: [String]) -> String {
+        guard !urls.isEmpty else { return "" }
+        func key(_ href: String) -> String? {
+            guard var url = URLComponents(string: href), let host = url.host else { return nil }
+            url.scheme = url.scheme?.lowercased()
+            url.host = host.lowercased()
+            if url.percentEncodedPath.isEmpty { url.percentEncodedPath = "/" }
+            if let query = url.percentEncodedQuery {
+                let params = query.components(separatedBy: "&").filter { $0 != "utm_source=openai" }
+                url.percentEncodedQuery = params.isEmpty ? nil : params.joined(separator: "&")
+            }
+            return url.string
+        }
+
+        let body = text as NSString
+        var linked = Set(inlineCitationDestination.matches(in: text, range: NSRange(location: 0, length: body.length))
+            .compactMap { key(body.substring(with: $0.range(at: 1))) })
+        let links = urls.compactMap { href -> String? in
+            let destination = href.replacingOccurrences(of: "(", with: "%28").replacingOccurrences(of: ")", with: "%29")
+            guard let host = URL(string: destination)?.host, let id = key(destination),
+                  linked.insert(id).inserted else { return nil }
+            let label = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            return "[\(label)](\(destination))"
+        }
+        return links.isEmpty ? "" : "\n\n" + links.joined(separator: " ")
+    }
+
     // MARK: - Chat Completions (API Key mode)
 
     private func streamChatCompletions(
@@ -335,6 +366,8 @@ final class OpenAIAgentProvider: AgentProvider {
                 // thinking accumulates for end-of-turn persistence and streams
                 // live as .thinkingDelta (same gating as the reasoning_content
                 // field path); visible opens the text block on first output.
+                var citationText = ""
+                var citationURLs: [String] = []
                 func emitParsed(_ out: (thinking: String, visible: String)) {
                     if !out.thinking.isEmpty {
                         reasoningContent += out.thinking
@@ -350,9 +383,16 @@ final class OpenAIAgentProvider: AgentProvider {
                             continuation.yield(.contentBlockStart(.text))
                             emittedTextStart = true
                         }
+                        if self.model.nativeWebEnabled == true { citationText += out.visible }
                         continuation.yield(.textDelta(out.visible))
                         diagYieldedAnyContent = true
                     }
+                }
+
+                func finishCitations() {
+                    let footer = Self.citationFooter(citationText, citationURLs)
+                    citationURLs.removeAll()
+                    if !footer.isEmpty { emitParsed(("", footer)) }
                 }
 
                 do {
@@ -367,6 +407,7 @@ final class OpenAIAgentProvider: AgentProvider {
                             // Flush the think parser's tail (cross-chunk tag
                             // fragment / withheld trailing whitespace).
                             emitParsed(thinkParser.finishTurn())
+                            finishCitations()
                             if sawReasoningFieldEver || !reasoningContent.isEmpty {
                                 continuation.yield(.reasoningContent(String(reasoningContent[(lastWebStepReasoningStart ?? reasoningContent.startIndex)...])))
                             }
@@ -426,6 +467,9 @@ final class OpenAIAgentProvider: AgentProvider {
 
                         let finishReason = choice["finish_reason"] as? String
                         let delta = choice["delta"] as? [String: Any] ?? [:]
+                        if self.model.nativeWebEnabled == true {
+                            citationURLs += (delta["annotations"] as? [[String: Any]] ?? []).compactMap(Self.citationURL)
+                        }
                         if choice["server_tool_event"] is [String: Any] { continuation.yield(.streamActivity) }
 
                         // Reasoning content from thinking models via dedicated fields.
@@ -590,10 +634,7 @@ final class OpenAIAgentProvider: AgentProvider {
                             // Flush the think parser's tail (idempotent — the
                             // [DONE] handler may flush again harmlessly).
                             emitParsed(thinkParser.finishTurn())
-                            let urls = self.model.nativeWebEnabled == true ? (delta["annotations"] as? [[String: Any]] ?? []).compactMap(Self.citationURL) : []
-                            if !urls.isEmpty {
-                                emitParsed(("", "\n\n" + urls.map { "<\($0)>" }.joined(separator: " ")))
-                            }
+                            finishCitations()
                             if self.isDeepSeekWebEndpoint, self.model.nativeWebEnabled == true,
                                let calls = delta["server_tool_calls"] as? [[String: Any]],
                                let replay = Self.replayJSON(calls) {
@@ -847,6 +888,7 @@ final class OpenAIAgentProvider: AgentProvider {
                 // but a defensive fallback in case the field is absent.
                 var currentReasoningItemId: String? = nil
                 var citationURLs: [String] = []
+                var citationText = ""
 
                 do {
                     for try await line in lineStream {
@@ -889,6 +931,7 @@ final class OpenAIAgentProvider: AgentProvider {
                                 emittedTextStart = true
                             }
                             if let delta = event["delta"] as? String {
+                                if self.model.nativeWebEnabled == true { citationText += delta }
                                 continuation.yield(.textDelta(delta))
                             }
 
@@ -1028,8 +1071,13 @@ final class OpenAIAgentProvider: AgentProvider {
                                     }
                                 }
                             }
-                            if !citationURLs.isEmpty {
-                                continuation.yield(.textDelta("\n\n" + citationURLs.map { "<\($0)>" }.joined(separator: " ")))
+                            let footer = Self.citationFooter(citationText, citationURLs)
+                            if !footer.isEmpty {
+                                if !emittedTextStart {
+                                    continuation.yield(.contentBlockStart(.text))
+                                    emittedTextStart = true
+                                }
+                                continuation.yield(.textDelta(footer))
                             }
                             let webReplay = self.isDeepSeekWebEndpoint && self.model.nativeWebEnabled == true &&
                                 outputItems.contains { $0["type"] as? String == "web_search_call" }

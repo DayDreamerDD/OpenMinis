@@ -1211,6 +1211,11 @@ class OpenAIProvider private constructor(
         val responsesToolCalls = mutableMapOf<String, ResponsesToolCallAccumulator>()
         var nativeReplay: String? = null
         val citationUrls = linkedSetOf<String>()
+        val citationText = if (nativeWebEnabled) StringBuilder() else null
+        suspend fun emitVisible(text: String) {
+            citationText?.append(text)
+            send(LLMStreamChunk.Text(text))
+        }
         var lastWebStepReasoningStart = 0
         fun addCitation(annotation: JSONObject?) {
             if (!nativeWebEnabled || annotation?.optString("type") != "url_citation") return
@@ -1220,7 +1225,8 @@ class OpenAIProvider private constructor(
         }
         suspend fun finishNativeWeb() {
             if (citationUrls.isNotEmpty()) {
-                send(LLMStreamChunk.Text(citationUrls.joinToString(" ", prefix = "\n\n") { "<$it>" }))
+                val footer = openAICitationFooter(citationText ?: "", citationUrls)
+                if (footer.isNotEmpty()) send(LLMStreamChunk.Text(footer))
                 citationUrls.clear()
             }
         }
@@ -1293,7 +1299,7 @@ class OpenAIProvider private constructor(
                             reasoningAccum.append(fin.thinking)
                             send(LLMStreamChunk.ThinkingDelta(fin.thinking))
                         }
-                        if (fin.visible.isNotEmpty()) send(LLMStreamChunk.Text(fin.visible))
+                        if (fin.visible.isNotEmpty()) emitVisible(fin.visible)
                     }
                     // [T-android-think-prefix-stream] Persist reasoning captured
                     // EITHER from the `reasoning_content` field or from a
@@ -1409,7 +1415,7 @@ class OpenAIProvider private constructor(
                         type == "response.output_text.annotation.added" -> addCitation(event.optJSONObject("annotation"))
                         type == "response.output_text.delta" -> {
                             val delta = event.optString("delta", "")
-                            if (delta.isNotEmpty()) send(LLMStreamChunk.Text(delta))
+                            if (delta.isNotEmpty()) emitVisible(delta)
                         }
                         // function_call item announced — capture call_id + name, start accumulator.
                         type == "response.output_item.added" -> {
@@ -1770,7 +1776,7 @@ class OpenAIProvider private constructor(
                                     reasoningAccum.append(out.thinking)
                                     send(LLMStreamChunk.ThinkingDelta(out.thinking))
                                 }
-                                if (out.visible.isNotEmpty()) send(LLMStreamChunk.Text(out.visible))
+                                if (out.visible.isNotEmpty()) emitVisible(out.visible)
                             }
                         }
 
@@ -1850,7 +1856,7 @@ class OpenAIProvider private constructor(
                     reasoningAccum.append(fin.thinking)
                     send(LLMStreamChunk.ThinkingDelta(fin.thinking))
                 }
-                if (fin.visible.isNotEmpty()) send(LLMStreamChunk.Text(fin.visible))
+                if (fin.visible.isNotEmpty()) emitVisible(fin.visible)
             }
 
             // Emit ToolCallComplete for all accumulated tool calls
@@ -1914,7 +1920,7 @@ class OpenAIProvider private constructor(
                         reasoningAccum.append(fin.thinking)
                         send(LLMStreamChunk.ThinkingDelta(fin.thinking))
                     }
-                    if (fin.visible.isNotEmpty()) send(LLMStreamChunk.Text(fin.visible))
+                    if (fin.visible.isNotEmpty()) emitVisible(fin.visible)
                 }
                 if (sawReasoningField || reasoningAccum.isNotEmpty()) {
                     send(LLMStreamChunk.ReasoningContent(reasoningAccum.substring(lastWebStepReasoningStart)))
