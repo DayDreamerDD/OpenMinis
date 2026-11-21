@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      NDK_VERSION: 28.0.12433566
+      NDK_VERSION: 28.2.13676358
       BUILD_TOOLS: 36.0.0
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +27,8 @@ jobs:
         with:
           go-version-file: deps/rclone-mobile/go.mod
           cache: false
+
+      - uses: android-actions/setup-android@v3
 
       - name: Install Android build tools
         run: |
