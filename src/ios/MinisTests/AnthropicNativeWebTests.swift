@@ -36,22 +36,10 @@ private final class AnthropicNativeWebFixture: URLProtocol {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        let data: Data
-        if let body = request.httpBody {
-            data = body
-        } else if let stream = request.httpBodyStream {
-            stream.open()
-            defer { stream.close() }
-            var body = Data()
-            var buffer = [UInt8](repeating: 0, count: 1024)
-            while true {
-                let n = stream.read(&buffer, maxLength: buffer.count)
-                if n <= 0 { break }
-                body.append(contentsOf: buffer.prefix(n))
-            }
-            data = body
-        } else { data = Data() }
         do {
+            let mutable = try XCTUnwrap((request as NSURLRequest).mutableCopy() as? NSMutableURLRequest)
+            RequestBodyPatcher.materializeBodyStream(mutable)
+            let data = try XCTUnwrap(mutable.httpBody)
             let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
             let messages = try XCTUnwrap(body["messages"] as? [[String: Any]])
             let tools = try XCTUnwrap(body["tools"] as? [[String: Any]])

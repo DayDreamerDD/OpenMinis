@@ -6,6 +6,8 @@ import com.openminis.app.data.model.LLMModel
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class OpenAINativeWebTest {
@@ -40,7 +42,7 @@ class OpenAINativeWebTest {
         val model = LLMModel(id = "deepseek-flash", displayName = "Flash", provider = "Test")
         val provider = OpenAIProvider(apiKey = "k", model = model, basePath = endpoint)
         val call = JSONObject().put("type", "web_search_call").put("signature", "opaque")
-        val envelope = JSONObject().put("items", JSONArray().put(call)).put("base", endpoint).put("model", model.id)
+        val envelope = JSONObject().put("items", JSONArray().put(call))
         fun input(responses: Boolean, enabled: Boolean): String {
             val history = listOf(
                 LLMMessage(LLMMessage.Role.ASSISTANT, "answer", nativeWebReplay = envelope.toString()),
@@ -55,14 +57,15 @@ class OpenAINativeWebTest {
         }
         for (responses in listOf(false, true)) {
             envelope.put("base", endpoint).put("model", model.id).put("responses", responses)
-            assertEquals(true, "opaque" in input(responses, true))
-            assertEquals(true, "answer" in input(responses, true))
-            assertEquals(false, "opaque" in input(!responses, true))
-            assertEquals(false, "opaque" in input(responses, false))
+            val replayed = input(responses, true)
+            assertTrue("opaque" in replayed)
+            assertTrue("answer" in replayed)
+            assertFalse("opaque" in input(!responses, true))
+            assertFalse("opaque" in input(responses, false))
             envelope.put("model", "another-model")
-            assertEquals(false, "opaque" in input(responses, true))
+            assertFalse("opaque" in input(responses, true))
             envelope.put("model", model.id).put("base", "https://other.example.com")
-            assertEquals(false, "opaque" in input(responses, true))
+            assertFalse("opaque" in input(responses, true))
         }
     }
 }
