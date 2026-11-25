@@ -20,8 +20,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -147,10 +149,27 @@ class AnthropicProvider(
         tools: List<AgentToolDefinition>,
         thinkingLevel: ThinkingLevel,
         nativeWebEnabled: Boolean,
-    ): Flow<LLMStreamChunk> {
+    ): Flow<LLMStreamChunk> = flow {
         val body = buildRequestBody(messages, systemPrompt, maxTokens, stream = true, temperature = temperature, imageParts = imageParts, tools = tools, thinkingLevel = thinkingLevel, nativeWebEnabled = nativeWebEnabled)
         val nativeWeb = nativeWebEnabled && AnthropicWebTools.addTo(body, basePath, model.id)
-        return streamBody(body, nativeWeb, 0)
+        var emitted = false
+        try {
+            streamBody(body, nativeWeb, 0).collect {
+                emitted = true
+                emit(it)
+            }
+        } catch (e: LLMError) {
+            // A relay can implement the Messages protocol without the hosted
+            // web tools. That request fails 400 before the first byte, so retry
+            // once as a plain request instead of leaving the model unusable.
+            if (!nativeWeb || emitted || !AnthropicWebTools.isUnsupportedToolError(e)) throw e
+            com.openminis.app.logging.AppLogger.warning(
+                "AnthropicProvider",
+                "Endpoint rejected the hosted web tools; retrying without native web: ${e.message?.take(200)}",
+            )
+            val plain = buildRequestBody(messages, systemPrompt, maxTokens, stream = true, temperature = temperature, imageParts = imageParts, tools = tools, thinkingLevel = thinkingLevel, nativeWebEnabled = false)
+            emitAll(streamBody(plain, false, 0))
+        }
     }
 
     private fun streamBody(body: JSONObject, nativeWeb: Boolean, pauses: Int, preceding: JSONArray = JSONArray(),

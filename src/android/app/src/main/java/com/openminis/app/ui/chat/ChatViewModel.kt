@@ -16100,20 +16100,30 @@ class ChatViewModel(
         nativeWebReplay: String? = null,
     ): String = buildString {
         append("[")
-        parts.forEachIndexed { index, part ->
-            if (index > 0) append(",")
-            // Keep wire metadata on the first part. Existing readers display its normal value.
-            val replayField = if (index == 0 && nativeWebReplay != null) {
-                "\"nativeWebReplay\":${escapeJson(nativeWebReplay)},"
-            } else ""
+        var wrotePart = false
+        fun separate() {
+            if (wrotePart) append(",")
+            wrotePart = true
+        }
+        // Keep wire metadata on the first part actually written. Assuming index 0
+        // is a text/toolUse part drops the replay whenever a skipped part leads
+        // the turn, and emitting the separator before the skip check produced
+        // invalid JSON such as `[,{…}]`.
+        var replayWritten = false
+        fun replayField(): String = if (!replayWritten && nativeWebReplay != null) {
+            replayWritten = true
+            "\"nativeWebReplay\":${escapeJson(nativeWebReplay)},"
+        } else ""
+        for (part in parts) {
             when (part) {
                 is AgentContentPart.Text -> {
-                    append("""{${replayField}"type":"text","value":${escapeJson(part.text)}}""")
+                    separate()
+                    append("""{${replayField()}"type":"text","value":${escapeJson(part.text)}}""")
                 }
                 is AgentContentPart.ToolUse -> {
                     // Skip tool_use with blank name — upstream bug guard.
                     val name = part.name
-                    if (name.isBlank()) return@forEachIndexed
+                    if (name.isBlank()) continue
                     val inputStr = part.input.toString()
                     val meta = toolBlockMeta[part.id]
                     val desc = meta?.toolTitle ?: ""
@@ -16123,7 +16133,8 @@ class ChatViewModel(
                     // signature (null-literal when absent) so it survives a session
                     // reload and can be replayed on the historical functionCall.
                     val sigJson = part.thoughtSignature?.let { escapeJson(it) } ?: "null"
-                    append("""{${replayField}"type":"toolUse","value":{"toolUseId":${escapeJson(part.id)},"name":${escapeJson(name)},"input":${escapeJson(inputStr)},"description":${escapeJson(desc)},"pageURL":${escapeJson(pageURL)},"imageFilePath":${escapeJson(imgPath)},"thoughtSignature":$sigJson}}""")
+                    separate()
+                    append("""{${replayField()}"type":"toolUse","value":{"toolUseId":${escapeJson(part.id)},"name":${escapeJson(name)},"input":${escapeJson(inputStr)},"description":${escapeJson(desc)},"pageURL":${escapeJson(pageURL)},"imageFilePath":${escapeJson(imgPath)},"thoughtSignature":$sigJson}}""")
                 }
                 else -> { /* tool_result is persisted via persistToolResultMessage */ }
             }

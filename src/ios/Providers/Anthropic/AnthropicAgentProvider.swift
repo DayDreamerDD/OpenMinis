@@ -1311,6 +1311,16 @@ enum AnthropicWebTools {
         }
     }
 
+    /// A 400 that names the hosted web tools. Relays that speak the Messages
+    /// protocol often implement the chat surface but not `web_search_20250305`;
+    /// the caller retries once without them rather than failing the turn.
+    static func isUnsupportedToolError(_ detail: String) -> Bool {
+        let text = detail.lowercased()
+        if text.contains("web_search") || text.contains("web_fetch") || text.contains("deepseek_web") { return true }
+        let unsupported = ["unsupported", "not supported", "not support", "unknown", "invalid"]
+        return text.contains("tool") && unsupported.contains { text.contains($0) }
+    }
+
     static func declarations(base: String, model: String) -> [[String: Any]] {
         if URL(string: base)?.host?.lowercased() == "api.deepseek.com" {
             guard model == "deepseek-flash" else { return [] }
@@ -1399,6 +1409,17 @@ extension AnthropicAgentProvider {
                             for try await line in bytes.lines {
                                 detail += String(line.prefix(2048))
                                 if detail.count >= 2048 { break }
+                            }
+                            // A relay can speak the Messages protocol without the
+                            // hosted web tools. Nothing has been yielded yet, so one
+                            // retry without them is safe and keeps the model usable.
+                            if status == 400, round == 0, AnthropicWebTools.isUnsupportedToolError(detail) {
+                                let webTypes = Set(tools.compactMap { $0["type"] as? String })
+                                body["tools"] = (body["tools"] as? [[String: Any]] ?? []).filter {
+                                    guard let type = $0["type"] as? String else { return true }
+                                    return !webTypes.contains(type)
+                                }
+                                continue
                             }
                             switch status {
                             case 401, 403: throw LLMError.invalidAPIKey(detail: detail)

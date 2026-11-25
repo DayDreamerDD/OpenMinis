@@ -5,6 +5,31 @@ internal class GeminiGrounding {
     val chunkURLs = mutableListOf<String?>()
     val supports = mutableListOf<Pair<String, List<Int>>>()
 
+    /**
+     * Merge one streamed chunk's grounding metadata.
+     *
+     * `groundingChunkIndices` are absolute positions in the response's chunk
+     * list, but the stream can deliver that list two different ways: each
+     * chunk may carry only its new entries, or every chunk may repeat the
+     * whole (growing) list. Blindly appending the second shape duplicates
+     * URLs and shifts every later index, so a repeated snapshot replaces the
+     * list instead of extending it.
+     */
+    fun recordChunk(urls: List<String?>, chunkSupports: List<Pair<String, List<Int>>>) {
+        if (urls.isNotEmpty()) {
+            when {
+                chunkURLs.isEmpty() -> chunkURLs.addAll(urls)
+                urls == chunkURLs -> Unit
+                urls.size > chunkURLs.size && chunkURLs.indices.all { urls[it] == chunkURLs[it] } -> {
+                    chunkURLs.clear()
+                    chunkURLs.addAll(urls)
+                }
+                else -> chunkURLs.addAll(urls)
+            }
+        }
+        for (support in chunkSupports) if (support !in supports) supports.add(support)
+    }
+
     fun sourceText(answer: String, sources: Set<String>): String {
         val cited = mutableSetOf<String>()
         val lines = linkedSetOf<String>()

@@ -6,6 +6,25 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class GeminiNativeWebTest {
+    @Test fun repeatedGroundingSnapshotsDoNotShiftIndices() {
+        val grounding = GeminiGrounding()
+        val first = "https://example.com/first"
+        val second = "https://example.com/second"
+        // A cumulative snapshot repeated on every chunk must replace the list,
+        // not append to it: groundingChunkIndices address the full snapshot.
+        grounding.recordChunk(listOf(first), emptyList())
+        grounding.recordChunk(listOf(first, second), emptyList())
+        assertEquals(listOf(first, second), grounding.chunkURLs)
+        // Incremental chunks still append.
+        val third = "https://example.com/third"
+        grounding.recordChunk(listOf(third), emptyList())
+        assertEquals(listOf(first, second, third), grounding.chunkURLs)
+        // A repeated support is recorded once.
+        grounding.recordChunk(emptyList(), listOf("quote" to listOf(1)))
+        grounding.recordChunk(emptyList(), listOf("quote" to listOf(1)))
+        assertEquals(1, grounding.supports.size)
+    }
+
     @Test fun signedHistoryRequiresIdenticalTextAndToolArguments() {
         val parts = """[{"thought":true,"text":"private"},{"toolCall":{"id":"search"}},{"text":"臺北 🌧"},{"functionCall":{"name":"write","args":{"flag":true,"where":{"b":"note","a":2}}}}]"""
         val args = """{"where":{"a":2,"b":"note"},"flag":true}"""

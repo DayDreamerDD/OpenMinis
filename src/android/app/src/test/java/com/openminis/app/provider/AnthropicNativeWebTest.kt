@@ -60,6 +60,16 @@ class AnthropicNativeWebTest {
         }
     }
 
+    @Test fun unsupportedWebTool400IsRecognisable() {
+        fun err(status: Int, detail: String) =
+            com.openminis.app.data.model.LLMError.ProviderError(detail, httpStatus = status)
+        assertTrue(AnthropicWebTools.isUnsupportedToolError(err(400, "tools: web_search_20250305 is not supported")))
+        assertTrue(AnthropicWebTools.isUnsupportedToolError(err(400, "unsupported tool type web_fetch")))
+        assertFalse(AnthropicWebTools.isUnsupportedToolError(err(500, "web_search failed")))
+        assertFalse(AnthropicWebTools.isUnsupportedToolError(err(400, "max_tokens must be positive")))
+        assertFalse(AnthropicWebTools.isUnsupportedToolError(err(400, "tool_use ids were found without tool_result blocks")))
+    }
+
     @Test fun officialDeepSeekUsesItsOwnWebDeclarations() {
         val body = JSONObject()
         val base = "https://api.deepseek.com/anthropic"

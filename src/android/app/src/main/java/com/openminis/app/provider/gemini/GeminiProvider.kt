@@ -218,19 +218,23 @@ class GeminiProvider(
 
                 if (nativeWebEnabled) {
                     val candidate = json.optJSONArray("candidates")?.optJSONObject(0)
-                    val chunks = candidate?.optJSONObject("groundingMetadata")?.optJSONArray("groundingChunks")
+                    val metadata = candidate?.optJSONObject("groundingMetadata")
+                    val chunkURLs = mutableListOf<String?>()
+                    val chunks = metadata?.optJSONArray("groundingChunks")
                     for (i in 0 until (chunks?.length() ?: 0)) {
                         val url = chunks?.optJSONObject(i)?.optJSONObject("web")?.optString("uri")
-                        grounding.chunkURLs.add(url)
+                        chunkURLs.add(url)
                         url?.let { addWebSource(sources, it) }
                     }
-                    val supports = candidate?.optJSONObject("groundingMetadata")?.optJSONArray("groundingSupports")
-                    for (i in 0 until (supports?.length() ?: 0)) {
-                        val support = supports?.optJSONObject(i) ?: continue
-                        val text = support.optJSONObject("segment")?.optString("text") ?: continue
+                    val chunkSupports = mutableListOf<Pair<String, List<Int>>>()
+                    val supportEntries = metadata?.optJSONArray("groundingSupports")
+                    for (i in 0 until (supportEntries?.length() ?: 0)) {
+                        val support = supportEntries?.optJSONObject(i) ?: continue
+                        val segment = support.optJSONObject("segment")?.optString("text") ?: continue
                         val indices = support.optJSONArray("groundingChunkIndices") ?: continue
-                        grounding.supports.add(text to (0 until indices.length()).map { indices.optInt(it, -1) })
+                        chunkSupports.add(segment to (0 until indices.length()).map { indices.optInt(it, -1) })
                     }
+                    grounding.recordChunk(chunkURLs, chunkSupports)
                     val urls = candidate?.optJSONObject("urlContextMetadata")?.optJSONArray("urlMetadata")
                     for (i in 0 until (urls?.length() ?: 0)) {
                         val entry = urls?.optJSONObject(i) ?: continue

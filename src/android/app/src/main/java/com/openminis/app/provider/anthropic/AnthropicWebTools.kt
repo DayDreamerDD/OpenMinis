@@ -1,6 +1,7 @@
 package com.openminis.app.provider.anthropic
 
 import com.openminis.app.data.model.AgentContentPart
+import com.openminis.app.data.model.LLMError
 import com.openminis.app.data.model.LLMMessage
 import kotlinx.serialization.json.Json
 import java.net.URI
@@ -27,7 +28,22 @@ internal object AnthropicWebTools {
     }
 
     fun restore(message: LLMMessage, base: String, model: String): JSONArray? {
-        val obj = message.nativeWebReplay?.let { runCatching { JSONObject(it) }.getOrNull() } ?: return null
+        val raw = message.nativeWebReplay ?: return null
+        val restored = restoreOrNull(message, raw, base, model)
+        if (restored == null) {
+            // The turn genuinely used native web but the visible projection no
+            // longer matches (edited, pruned, offloaded arguments, model/base
+            // switch). Falling back to plain text is correct, but silent.
+            android.util.Log.d(
+                "AnthropicWebTools",
+                "native web replay dropped: model=$model base=$base — history no longer matches the signed blocks",
+            )
+        }
+        return restored
+    }
+
+    private fun restoreOrNull(message: LLMMessage, raw: String, base: String, model: String): JSONArray? {
+        val obj = runCatching { JSONObject(raw) }.getOrNull() ?: return null
         if (obj.optString("protocol") != "anthropic-messages" || obj.optString("base") != base || obj.optString("model") != model) return null
         val blocks = obj.optJSONArray("blocks") ?: return null
         val parts = message.contentParts
@@ -43,6 +59,20 @@ internal object AnthropicWebTools {
             if (Json.parseToJsonElement(call.input.toString()) != Json.parseToJsonElement(input.toString())) return null
         }
         return blocks
+    }
+
+    /**
+     * A 400 that names the hosted web tools. Relays that speak the Messages
+     * protocol often implement the chat surface but not `web_search_20250305`;
+     * the caller retries once without them rather than failing the turn.
+     */
+    fun isUnsupportedToolError(error: Throwable): Boolean {
+        val provider = error as? LLMError.ProviderError ?: return false
+        if (provider.httpStatus != 400) return false
+        val detail = provider.detail.lowercase()
+        if ("web_search" in detail || "web_fetch" in detail || "deepseek_web" in detail) return true
+        val unsupported = listOf("unsupported", "not supported", "not support", "unknown", "invalid")
+        return "tool" in detail && unsupported.any { it in detail }
     }
 
     fun addTo(body: JSONObject, basePath: String, model: String): Boolean {
