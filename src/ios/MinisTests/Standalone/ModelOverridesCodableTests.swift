@@ -14,7 +14,7 @@
 
 import Foundation
 
-// Models the fields used in the custom-parameter fixtures below.
+// Mirrors the shipped ModelOverrides Codable surface.
 enum ThinkingLevel: String, Codable { case off, low, medium, high, xhigh
     static func decoded(_ r: String) -> ThinkingLevel? { ThinkingLevel(rawValue: r) } }
 struct ModelModality: Codable, Hashable { var raw: String }
@@ -23,17 +23,19 @@ struct ModelOverrides: Codable, Hashable {
     var displayName: String?; var maxOutputTokens: Int?
     var modalityOverride: ModelModality?; var contextWindow: Int?
     var supportsReasoning: Bool?; var maxThinkingLevel: ThinkingLevel?
+    var nativeWebEnabled: Bool?
     var temperature: Double?; var topP: Double?
     var customHeaders: [String: String]?; var extraBodyParams: [String: String]?
 
     var isEmpty: Bool {
         displayName == nil && maxOutputTokens == nil && modalityOverride == nil
             && contextWindow == nil && supportsReasoning == nil && maxThinkingLevel == nil
+            && nativeWebEnabled == nil
             && temperature == nil && topP == nil && customHeaders == nil && extraBodyParams == nil
     }
     private enum CodingKeys: String, CodingKey {
         case displayName, maxOutputTokens, modalityOverride, contextWindow, supportsReasoning, maxThinkingLevel
-        case temperature, topP, customHeaders, extraBodyParams
+        case nativeWebEnabled, temperature, topP, customHeaders, extraBodyParams
     }
     init() {}
     init(from d: Decoder) throws {
@@ -44,6 +46,7 @@ struct ModelOverrides: Codable, Hashable {
         contextWindow = try c.decodeIfPresent(Int.self, forKey: .contextWindow)
         supportsReasoning = try c.decodeIfPresent(Bool.self, forKey: .supportsReasoning)
         if let r = try c.decodeIfPresent(String.self, forKey: .maxThinkingLevel) { maxThinkingLevel = ThinkingLevel.decoded(r) }
+        nativeWebEnabled = try c.decodeIfPresent(Bool.self, forKey: .nativeWebEnabled)
         temperature = try c.decodeIfPresent(Double.self, forKey: .temperature)
         topP = try c.decodeIfPresent(Double.self, forKey: .topP)
         customHeaders = try c.decodeIfPresent([String: String].self, forKey: .customHeaders)
@@ -57,6 +60,7 @@ struct ModelOverrides: Codable, Hashable {
         try c.encodeIfPresent(contextWindow, forKey: .contextWindow)
         try c.encodeIfPresent(supportsReasoning, forKey: .supportsReasoning)
         try c.encodeIfPresent(maxThinkingLevel?.rawValue, forKey: .maxThinkingLevel)
+        try c.encodeIfPresent(nativeWebEnabled, forKey: .nativeWebEnabled)
         try c.encodeIfPresent(temperature, forKey: .temperature)
         try c.encodeIfPresent(topP, forKey: .topP)
         try c.encodeIfPresent(customHeaders, forKey: .customHeaders)
@@ -133,6 +137,10 @@ if src.isEmpty {
     ck("isEmpty covers all four",
        src.contains("&& temperature == nil") && src.contains("&& topP == nil")
        && src.contains("&& customHeaders == nil") && src.contains("&& extraBodyParams == nil"))
+    ck("native web field declared", src.contains("var nativeWebEnabled: Bool?"))
+    ck("isEmpty covers native web", src.contains("&& nativeWebEnabled == nil"))
+    ck("decode reads native web", src.contains("decodeIfPresent(Bool.self, forKey: .nativeWebEnabled)"))
+    ck("encode writes native web", src.contains("encodeIfPresent(nativeWebEnabled, forKey: .nativeWebEnabled)"))
     ck("decode uses decodeIfPresent for all four",
        src.contains("decodeIfPresent(Double.self, forKey: .temperature)")
        && src.contains("decodeIfPresent(Double.self, forKey: .topP)")
@@ -177,7 +185,7 @@ func modalityWire(_ m: ModelModality?) -> Int? { m.flatMap { Int($0.raw) } }
 func modalityFromWire(_ i: Int?) -> ModelModality? { i.map { ModelModality(raw: String($0)) } }
 func mod(_ i: Int) -> ModelModality { ModelModality(raw: String(i)) }
 
-/// Export the fixture fields using the provider sharing format.
+/// Verbatim from exportInstanceJSON's `if !entry.overrides.isEmpty` block.
 func exportOverrides(_ o: ModelOverrides) -> [String: Any]? {
     guard !o.isEmpty else { return nil }
     var d: [String: Any] = [:]
@@ -187,6 +195,7 @@ func exportOverrides(_ o: ModelOverrides) -> [String: Any]? {
     if let ctx = o.contextWindow { d["contextWindow"] = ctx }
     if let sr = o.supportsReasoning { d["supportsReasoning"] = sr }
     if let mtl = o.maxThinkingLevel { d["maxThinkingLevel"] = mtl.rawValue }
+    if let web = o.nativeWebEnabled { d["nativeWebEnabled"] = web }
     if let temp = o.temperature { d["temperature"] = temp }
     if let tp = o.topP { d["topP"] = tp }
     if let ch = o.customHeaders, !ch.isEmpty { d["customHeaders"] = ch }
@@ -194,7 +203,7 @@ func exportOverrides(_ o: ModelOverrides) -> [String: Any]? {
     return d
 }
 
-/// Read the fixture fields back from the provider sharing format.
+/// Verbatim from the import block.
 func importOverrides(_ d: [String: Any]?) -> ModelOverrides {
     var o = ModelOverrides()
     guard let d else { return o }
@@ -205,6 +214,7 @@ func importOverrides(_ d: [String: Any]?) -> ModelOverrides {
     o.supportsReasoning = d["supportsReasoning"] as? Bool
     o.maxThinkingLevel = (d["maxThinkingLevel"] as? String)
         .flatMap { ThinkingLevel(rawValue: $0.lowercased()) }
+    o.nativeWebEnabled = d["nativeWebEnabled"] as? Bool
     o.temperature = d["temperature"] as? Double
     o.topP = d["topP"] as? Double
     o.customHeaders = d["customHeaders"] as? [String: String]
@@ -227,6 +237,7 @@ exported.modalityOverride = mod(0b1011)
 exported.contextWindow = 200_000
 exported.supportsReasoning = true
 exported.maxThinkingLevel = .high
+exported.nativeWebEnabled = true
 exported.temperature = 0.35
 exported.topP = 0.95
 exported.customHeaders = ["X-Relay-Tenant": "acme", "X-Trace": "on"]
@@ -240,10 +251,23 @@ ck("modalityOverride survives (Int rawValue encoding)",
 ck("contextWindow survives", roundTripped.contextWindow == exported.contextWindow)
 ck("supportsReasoning survives", roundTripped.supportsReasoning == exported.supportsReasoning)
 ck("maxThinkingLevel survives (lowercase level id)", roundTripped.maxThinkingLevel == .high)
+ck("native web survives provider export and import", roundTripped.nativeWebEnabled == true)
 ck("temperature survives exactly", roundTripped.temperature == 0.35)
 ck("topP survives exactly", roundTripped.topP == 0.95)
 ck("customHeaders survive, all keys", roundTripped.customHeaders == exported.customHeaders)
 ck("extraBodyParams survive, all keys", roundTripped.extraBodyParams == exported.extraBodyParams)
+
+// The failure this guards is structural: a field added to ModelOverrides and to
+// Codable but NOT to the two dictionary lists. So enumerate the fields here,
+// independently, and diff.
+let allOverrideFields = ["displayName", "maxOutputTokens", "modalityOverride", "contextWindow",
+                         "supportsReasoning", "maxThinkingLevel", "nativeWebEnabled",
+                         "temperature", "topP", "customHeaders", "extraBodyParams"]
+let exportedFieldKeys = Set(exportOverrides(exported)!.keys)
+let carried = allOverrideFields.filter { exportedFieldKeys.contains($0) }
+let dropped = allOverrideFields.filter { !exportedFieldKeys.contains($0) }
+ck("All override fields are carried by provider export", carried.count == allOverrideFields.count)
+ck("no field is dropped", dropped.isEmpty)
 
 print("\n[8] Partial and empty override objects restore exactly what was present")
 
